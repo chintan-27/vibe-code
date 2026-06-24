@@ -1,14 +1,25 @@
 import { dumpContext } from '@/context/budget.ts'
+import type { HooksConfig } from '@/hooks/hooks.ts'
 import { AgentSession } from '@/loop/session.ts'
 import type { EffortMode, SessionEvents } from '@/loop/types.ts'
 import { loadMemories } from '@/memory/memdir.ts'
 import { OllamaClient } from '@/provider/ollama.ts'
 import { stripThinkBlocks } from '@/toolcall/parse.ts'
+import { coreTools } from '@/tools/registry.ts'
+import type { AnyTool } from '@/tools/types.ts'
 
 export type ReplOptions = {
   workspaceRoot: string
   effort: EffortMode
+  allow?: string[]
+  hooks?: HooksConfig
+  extraTools?: AnyTool[]
 }
+
+const COMMIT_PROMPT =
+  'Commit the current changes. First run `git status` and `git diff --staged` (and `git add -A` if nothing is staged) using Bash, then write a clear commit message and run `git commit`. Show the message you used.'
+const REVIEW_PROMPT =
+  'Review the current working-tree changes. Run `git diff` (and `git status`) using Bash, then summarize the changes and flag any bugs or risks. Do not modify files.'
 
 const PROMPT = '› '
 
@@ -29,7 +40,29 @@ export async function runRepl(options: ReplOptions): Promise<void> {
   let session = newSession()
 
   function newSession(): AgentSession {
-    return new AgentSession({ client, workspaceRoot: options.workspaceRoot, effort, events })
+    return new AgentSession({
+      client,
+      workspaceRoot: options.workspaceRoot,
+      effort,
+      // Plain REPL has no interactive approval UI, so it runs unattended.
+      permissionMode: 'auto',
+      tools: options.extraTools && options.extraTools.length > 0 ? [...coreTools, ...options.extraTools] : undefined,
+      allow: options.allow,
+      hooks: options.hooks,
+      events,
+    })
+  }
+
+  async function runTurn(text: string): Promise<void> {
+    const start = performance.now()
+    streamed = ''
+    const result = await session.run(text)
+    process.stdout.write('\n')
+    const finalText = stripThinkBlocks(result.finalContent).trim()
+    if (finalText && !streamed.includes(finalText)) console.log(finalText)
+    console.error(
+      `[turns=${result.turns} tool_calls=${result.toolCalls} valid=${result.validToolCalls} repaired=${result.repairedToolCalls} compactions=${result.compactions} ${Math.round(performance.now() - start)}ms]`,
+    )
   }
 
   printBanner(options.workspaceRoot, effort)
@@ -71,6 +104,10 @@ export async function runRepl(options: ReplOptions): Promise<void> {
             ? '[no memories]'
             : memories.map(memory => `- ${memory.name} [${memory.type}] — ${memory.description}`).join('\n'),
         )
+      } else if (command === 'commit') {
+        await runTurn(COMMIT_PROMPT)
+      } else if (command === 'review') {
+        await runTurn(REVIEW_PROMPT)
       } else {
         console.log(`Unknown command: /${command}. Type /help.`)
       }
@@ -78,17 +115,7 @@ export async function runRepl(options: ReplOptions): Promise<void> {
       continue
     }
 
-    const start = performance.now()
-    streamed = ''
-    const result = await session.run(input)
-    process.stdout.write('\n')
-    // Print the final content only when it wasn't already streamed (e.g. a synthesized
-    // "stopped" / error status, or a non-streaming two-phase turn).
-    const finalText = stripThinkBlocks(result.finalContent).trim()
-    if (finalText && !streamed.includes(finalText)) console.log(finalText)
-    console.error(
-      `[turns=${result.turns} tool_calls=${result.toolCalls} valid=${result.validToolCalls} repaired=${result.repairedToolCalls} compactions=${result.compactions} ${Math.round(performance.now() - start)}ms]`,
-    )
+    await runTurn(input)
     process.stdout.write(PROMPT)
   }
 
@@ -117,6 +144,8 @@ function printHelp(): void {
   /context [query]   Print the curated context for a query
   /memory            List stored project memories
   /effort <m>        Switch effort: normal | medium | high (resets conversation)
+  /commit            Stage and commit current changes
+  /review            Review the working-tree diff
   /reset             Clear the conversation history
   /exit              Leave the REPL`)
 }

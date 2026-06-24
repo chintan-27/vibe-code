@@ -121,10 +121,21 @@ async function runAgent(agentArgs: string[]): Promise<void> {
 
 async function runReplCommand(replArgs: string[]): Promise<void> {
   const parsed = parsePromptArgs(replArgs)
-  await runRepl({
-    workspaceRoot: parsed.workspace ?? process.cwd(),
-    effort: parsed.effort ?? 'normal',
-  })
+  const root = parsed.workspace ?? process.cwd()
+  const settings = await loadSettings(root)
+  applyAmbientSettings(settings)
+  const mcp = await loadMcpTools(settings.mcpServers)
+  try {
+    await runRepl({
+      workspaceRoot: root,
+      effort: parsed.effort ?? 'normal',
+      allow: settings.allow,
+      hooks: settings.hooks,
+      extraTools: mcp.tools,
+    })
+  } finally {
+    mcp.close()
+  }
 }
 
 async function runTuiCommand(tuiArgs: string[]): Promise<void> {

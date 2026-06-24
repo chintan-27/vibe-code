@@ -1,6 +1,7 @@
 import { readFile } from 'fs/promises'
 import { join } from 'path'
 import type { DependencyGraph } from './depgraph.ts'
+import { embeddingsEnabled, semanticScores } from './embeddings.ts'
 import type { RepoMapEntry } from './repomap.ts'
 
 export type RetrievedSnippet = {
@@ -36,6 +37,20 @@ export async function retrieveSnippets(
   for (const entry of entries) {
     const { score, reason } = scoreEntry(entry, terms)
     if (score > 0) scores.set(entry.path, { score, reason })
+  }
+
+  // Optional semantic re-rank: blend cosine similarity into the matched candidates.
+  if (embeddingsEnabled() && scores.size > 0) {
+    const byPathEntry = new Map(entries.map(e => [e.path, e]))
+    const items = [...scores.keys()].map(path => {
+      const entry = byPathEntry.get(path)
+      return { key: path, text: `${path} ${entry?.symbols.map(s => s.signature).join(' ') ?? ''}` }
+    })
+    const sims = await semanticScores(query, items)
+    for (const [path, sim] of sims) {
+      const existing = scores.get(path)
+      if (existing) existing.score += sim * 12
+    }
   }
 
   // Graph expansion: pull neighbours of the strongest seeds at a discount.

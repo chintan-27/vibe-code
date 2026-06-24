@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import { buildDependencyGraph, pageRank } from './depgraph.ts'
 import { extractSignatures, buildRepoMap } from './repomap.ts'
 import { retrieveSnippets } from './retrieve.ts'
+import { dumpContext } from './budget.ts'
 
 describe('extractSignatures', () => {
   test('keeps exported declarations with signatures and drops local variables', () => {
@@ -67,5 +68,22 @@ describe('retrieveSnippets', () => {
     expect(paths[0]).toBe('src/parser.ts') // exact symbol-definition match ranks first
     expect(paths).toContain('src/caller.ts') // pulled in via graph expansion
     expect(paths).not.toContain('src/unrelated.ts')
+  })
+})
+
+describe('dumpContext (multi-file)', () => {
+  test('pulls the right files for a cross-file task and fits the budget', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-multifile-'))
+    await mkdir(join(ws, 'src'))
+    await writeFile(join(ws, 'src', 'auth.ts'), 'export function login(user: string) {\n  return `token-${user}`\n}\n', 'utf8')
+    await writeFile(join(ws, 'src', 'server.ts'), "import { login } from './auth.ts'\nexport const handler = (u: string) => login(u)\n", 'utf8')
+    await writeFile(join(ws, 'src', 'styles.ts'), 'export const color = "blue"\n', 'utf8')
+
+    const result = await dumpContext(ws, 'login authentication token', 12_000)
+    // The defining file and its importer both surface; the unrelated file does not.
+    expect(result.files).toContain('src/auth.ts')
+    expect(result.files).toContain('src/server.ts')
+    expect(result.files).not.toContain('src/styles.ts')
+    expect(result.approxTokens).toBeLessThanOrEqual(12_000)
   })
 })

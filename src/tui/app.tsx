@@ -103,6 +103,7 @@ export function App({ options }: { options: TuiOptions }) {
   const liveRef = useRef<Live>(freshLive())
   const dirtyRef = useRef(false)
   const tokensRef = useRef(0)
+  const turnStartRef = useRef(0)
   const [context, setContext] = useState<ContextInfo>({ files: [], approxTokens: 0 })
   const [tokensThisTurn, setTokensThisTurn] = useState(0)
   const [tokPerSec, setTokPerSec] = useState(0)
@@ -233,6 +234,7 @@ export function App({ options }: { options: TuiOptions }) {
     liveRef.current = { active: true, assistant: '', think: '', tools: [] }
     tokensRef.current = 0
     dirtyRef.current = false
+    turnStartRef.current = Date.now()
     setLive({ active: true, assistant: '', think: '', tools: [] })
     setTokensThisTurn(0)
 
@@ -288,6 +290,16 @@ export function App({ options }: { options: TuiOptions }) {
     if (text === '/clear') return setTranscript([])
     if (text === '/commit') return void submit(COMMIT_PROMPT)
     if (text === '/review') return void submit(REVIEW_PROMPT)
+    if (text.startsWith('/image')) {
+      const rest = text.slice('/image'.length).trim()
+      const [path, ...q] = rest.split(' ')
+      if (!path) {
+        setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: 'usage: /image <path> [question]' }])
+        return
+      }
+      const question = q.join(' ').trim()
+      return void submit(`Read ${path}${question ? ` then ${question}` : ' and describe what you see'}`)
+    }
     if (text.startsWith('/mode') || text.startsWith('/effort')) {
       const next = text.split(' ')[1]
       if (next === 'normal' || next === 'medium' || next === 'high') setEffort(next)
@@ -361,6 +373,8 @@ export function App({ options }: { options: TuiOptions }) {
     editText(value, key, runInputLine)
   })
 
+  const elapsedS = live.active ? Math.max(0, Math.round((Date.now() - turnStartRef.current) / 1000)) : 0
+
   return (
     <Box flexDirection="column" width={width}>
       <Static items={transcript}>{block => <BlockView key={block.id} block={block} width={width} />}</Static>
@@ -375,7 +389,7 @@ export function App({ options }: { options: TuiOptions }) {
             ) : (
               <Box marginTop={1}>
                 <Text color={C.muted} dimColor>
-                  {`${G.reasoning} thinking… ${approxTokens(live.think)} tok · ^R to expand`}
+                  {`${G.reasoning} thinking… ${approxTokens(live.think)} tok · ${elapsedS}s · ^R to expand`}
                 </Text>
               </Box>
             ))}
@@ -394,7 +408,7 @@ export function App({ options }: { options: TuiOptions }) {
           )}
           <Box marginTop={1}>
             <Text color={C.brandBright}>{`${SPINNER[frame]} `}</Text>
-            <Text color={C.muted}>{spinnerLabel(live)}</Text>
+            <Text color={C.muted}>{`${spinnerLabel(live)}  ${elapsedS}s`}</Text>
           </Box>
         </Box>
       )}
@@ -826,7 +840,7 @@ function PlanView({ actions, width }: { actions: PlannedAction[]; width: number 
   )
 }
 
-const HELP = `Commands:  /help  /effort normal|medium|high  /perm default|acceptEdits|plan|auto  /commit  /review  /clear  /exit
+const HELP = `Commands:  /help  /effort normal|medium|high  /perm default|acceptEdits|plan|auto  /image <path>  /commit  /review  /clear  /exit
 Approvals:  [y] allow once  [a] always  [n] deny   ·   Keys: ^R thinking  ^O context  ↑/↓ history  ^C quit`
 
 const COMMIT_PROMPT =
