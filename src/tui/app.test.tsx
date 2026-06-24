@@ -7,17 +7,17 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 describe('TUI App', () => {
   test('renders the status bar, model, and input prompt on mount', () => {
-    const { lastFrame, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'normal', permissionMode: 'auto' }} />)
+    const { lastFrame, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
     const frame = lastFrame() ?? ''
     expect(frame).toContain('qwen2.5-coder:7b')
-    expect(frame).toContain('normal')
+    expect(frame).toContain('medium')
     expect(frame).toContain('quit')
     expect(frame).toContain('❯')
     unmount()
   })
 
   test('echoes typed input', async () => {
-    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'normal', permissionMode: 'auto' }} />)
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
     await delay(50) // let mount effects + raw-mode setup settle
     stdin.write('hello there')
     await delay(50)
@@ -25,8 +25,23 @@ describe('TUI App', () => {
     unmount()
   })
 
+  test('backspace (mac DEL 0x7f and BS 0x08) deletes the last character', async () => {
+    for (const bs of ['\x7f', '\x08']) {
+      const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
+      await delay(50)
+      stdin.write('abcd')
+      await delay(30)
+      stdin.write(bs)
+      await delay(40)
+      const frame = lastFrame() ?? ''
+      expect(frame).toContain('abc')
+      expect(frame).not.toContain('abcd')
+      unmount()
+    }
+  })
+
   test('rapid pasted newlines stay in the buffer instead of submitting', async () => {
-    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'normal', permissionMode: 'auto' }} />)
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
     await delay(50)
     stdin.write('first line')
     stdin.write('\r') // arrives immediately → treated as a pasted newline, not submit
@@ -39,7 +54,7 @@ describe('TUI App', () => {
   })
 
   test('/help prints command help', async () => {
-    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'normal', permissionMode: 'auto' }} />)
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
     await delay(50)
     stdin.write('/help')
     await delay(80) // simulate a human pause before Enter (paste newlines arrive far faster)

@@ -86,12 +86,12 @@ export async function runRepl(options: ReplOptions): Promise<void> {
         session = newSession()
         console.log('Conversation reset.')
       } else if (command === 'mode' || command === 'effort') {
-        if (arg === 'normal' || arg === 'medium' || arg === 'high') {
+        if (arg === 'low' || arg === 'medium' || arg === 'high' || arg === 'xhigh') {
           effort = arg
           session = newSession()
           console.log(`Effort set to ${effort} (conversation reset).`)
         } else {
-          console.log(`Current effort: ${effort}. Use "/effort normal|medium|high".`)
+          console.log(`Current effort: ${effort}. Use "/effort low|medium|high|xhigh".`)
         }
       } else if (command === 'context') {
         const dump = await dumpContext(options.workspaceRoot, arg || 'overview')
@@ -143,7 +143,7 @@ function printHelp(): void {
   /help              Show this help
   /context [query]   Print the curated context for a query
   /memory            List stored project memories
-  /effort <m>        Switch effort: normal | medium | high (resets conversation)
+  /effort <m>        Switch effort: low | medium | high | xhigh (resets conversation)
   /commit            Stage and commit current changes
   /review            Review the working-tree diff
   /reset             Clear the conversation history

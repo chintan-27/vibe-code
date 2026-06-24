@@ -122,6 +122,8 @@ export class OllamaClient {
         stream,
         messages: messages.map(toOllamaMessage),
         format: options.format,
+        // Keep models resident between turns to avoid reload thrash when alternating models.
+        keep_alive: process.env.OLLAMA_KEEP_ALIVE ?? '15m',
         options: {
           temperature: options.temperature,
           num_predict: options.maxTokens,

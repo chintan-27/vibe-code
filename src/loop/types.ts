@@ -5,14 +5,13 @@ export type { ChatClient } from '@/provider/types.ts'
 import type { ChatClient } from '@/provider/types.ts'
 
 /**
- * Effort level. VibeThinker always reasons and decides; qwen extracts the
- * structured action. `high` additionally runs qwen + gemma as reviewers
- * ("overlookers") over VibeThinker's plan before acting.
- * - normal: brief reasoning, fastest
- * - medium: deeper reasoning
- * - high:   deep reasoning + reviewer pass
+ * Effort level. qwen always extracts the final structured action.
+ * - low:    no reasoning — qwen acts directly (fast lane)
+ * - medium: dynamic — a quick check decides whether VibeThinker reasoning is needed
+ * - high:   deep VibeThinker reasoning + qwen reviewer (gemma if VIBE_REVIEW_GEMMA=1)
+ * - xhigh:  deepest reasoning + qwen AND gemma reviewers (always)
  */
-export type EffortMode = 'normal' | 'medium' | 'high'
+export type EffortMode = 'low' | 'medium' | 'high' | 'xhigh'
 
 export type ContextInfo = { files: string[]; approxTokens: number }
 export type TurnUsage = { completionTokens: number; durationMs: number }
@@ -66,6 +65,7 @@ export type AgentLoopOptions = {
   permissionMode?: PermissionMode
   allow?: string[]
   hooks?: HooksConfig
+  events?: SessionEvents
 }
 
 export type AgentLoopResult = {

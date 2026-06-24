@@ -152,13 +152,6 @@ export function App({ options }: { options: TuiOptions }) {
       syncInput()
     }
   }
-  const deleteAt = () => {
-    const i = cursorRef.current
-    if (i < inputRef.current.length) {
-      inputRef.current = inputRef.current.slice(0, i) + inputRef.current.slice(i + 1)
-      syncInput()
-    }
-  }
   const moveCursor = (delta: number) => {
     cursorRef.current = Math.max(0, Math.min(inputRef.current.length, cursorRef.current + delta))
     setCursorView(cursorRef.current)
@@ -270,8 +263,8 @@ export function App({ options }: { options: TuiOptions }) {
   const editText = (value: string, key: Key, onSubmit: (text: string) => void) => {
     if (key.leftArrow) return moveCursor(-1)
     if (key.rightArrow) return moveCursor(1)
-    if (key.delete) return deleteAt()
-    if (key.backspace) return backspaceAt()
+    // macOS Backspace arrives as key.delete (DEL 0x7f); treat both as delete-before-cursor.
+    if (key.backspace || key.delete) return backspaceAt()
     if (key.return) {
       if (Date.now() - lastEditAt.current < PASTE_GAP_MS) return insertText('\n')
       const text = inputRef.current
@@ -302,8 +295,8 @@ export function App({ options }: { options: TuiOptions }) {
     }
     if (text.startsWith('/mode') || text.startsWith('/effort')) {
       const next = text.split(' ')[1]
-      if (next === 'normal' || next === 'medium' || next === 'high') setEffort(next)
-      else setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `effort is ${effort}. Use /effort normal|medium|high` }])
+      if (next === 'low' || next === 'medium' || next === 'high' || next === 'xhigh') setEffort(next)
+      else setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `effort is ${effort}. Use /effort low|medium|high|xhigh` }])
       return
     }
     if (text.startsWith('/perm')) {
@@ -840,7 +833,7 @@ function PlanView({ actions, width }: { actions: PlannedAction[]; width: number 
   )
 }
 
-const HELP = `Commands:  /help  /effort normal|medium|high  /perm default|acceptEdits|plan|auto  /image <path>  /commit  /review  /clear  /exit
+const HELP = `Commands:  /help  /effort low|medium|high|xhigh  /perm default|acceptEdits|plan|auto  /image <path>  /commit  /review  /clear  /exit
 Approvals:  [y] allow once  [a] always  [n] deny   ·   Keys: ^R thinking  ^O context  ↑/↓ history  ^C quit`
 
 const COMMIT_PROMPT =

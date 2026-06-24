@@ -62,23 +62,64 @@ export const evalCases: EvalCase[] = [
 
 export async function runEvalSuite(
   client: ChatClient,
-  effort: EffortMode = 'normal',
+  effort: EffortMode = 'low',
 ): Promise<EvalResult[]> {
   const results: EvalResult[] = []
 
-  for (const evalCase of evalCases) {
+  const log = (line: string) => process.stderr.write(`${line}\n`)
+  for (let i = 0; i < evalCases.length; i += 1) {
+    const evalCase = evalCases[i]!
+    log(`\n━━ [${i + 1}/${evalCases.length}] ${evalCase.name} ━━ (effort=${effort})`)
+    log(`  prompt: ${evalCase.prompt.slice(0, 100)}${evalCase.prompt.length > 100 ? '…' : ''}`)
+    const started = performance.now()
     const workspace = await mkdtemp(join(tmpdir(), `vibe-code-eval-${evalCase.name}-`))
     await evalCase.setup(workspace)
+
+    // Verbose, live progress for each case — stream VibeThinker's reasoning as it thinks.
+    let thinkChars = 0
+    let thinkingHeaderShown = false
+    const events = {
+      onThink: (t: string) => {
+        if (!thinkingHeaderShown) {
+          process.stderr.write('\n  \x1b[2m┌ thinking ─────\x1b[0m\n  \x1b[2m')
+          thinkingHeaderShown = true
+        }
+        thinkChars += t.length
+        process.stderr.write(t.replace(/\n/g, '\n  ')) // indent reasoning under the header
+      },
+      onToken: () => {
+        if (thinkingHeaderShown) {
+          process.stderr.write('\x1b[0m\n  \x1b[2m└──────────────\x1b[0m\n')
+          thinkingHeaderShown = false
+        }
+      },
+      onTool: (name: string, input: unknown) => {
+        if (thinkingHeaderShown) {
+          process.stderr.write('\x1b[0m\n  \x1b[2m└──────────────\x1b[0m\n')
+          thinkingHeaderShown = false
+        }
+        log(`  ⏺ ${name}(${argPreview(input)})`)
+      },
+      onToolResult: (name: string, ok: boolean, content: string) =>
+        log(`  ⎿ ${ok ? 'ok' : 'error'}: ${content.split('\n')[0]?.slice(0, 80) ?? ''}`),
+    }
+
     const loopResult = await runAgentLoop({
       client,
       workspaceRoot: workspace,
       prompt: evalCase.prompt,
       maxTurns: 8,
       effort,
+      events,
     })
+    const passed = await evalCase.verify(workspace)
+    log(
+      `  → ${passed ? 'PASS' : 'FAIL'} in ${Math.round((performance.now() - started) / 1000)}s · ${loopResult.turns} turns · ${loopResult.toolCalls} tool calls · ${thinkChars} think chars`,
+    )
+    if (!passed) log(`    final: ${loopResult.finalContent.slice(0, 160)}`)
     results.push({
       name: evalCase.name,
-      passed: await evalCase.verify(workspace),
+      passed,
       toolCalls: loopResult.toolCalls,
       validToolCalls: loopResult.validToolCalls,
       repairedToolCalls: loopResult.repairedToolCalls,
@@ -87,6 +128,17 @@ export async function runEvalSuite(
   }
 
   return results
+}
+
+function argPreview(input: unknown): string {
+  const text = (() => {
+    try {
+      return JSON.stringify(input)
+    } catch {
+      return String(input)
+    }
+  })()
+  return text.length > 70 ? `${text.slice(0, 69)}…` : text
 }
 
 export function summarizeEvalResults(results: EvalResult[]): string {

@@ -106,7 +106,7 @@ async function runAgent(agentArgs: string[]): Promise<void> {
     workspaceRoot: root,
     prompt: parsed.prompt,
     maxTurns: parsed.maxTurns,
-    effort: parsed.effort ?? 'normal',
+    effort: parsed.effort ?? 'medium',
     permissionMode: parsed.permissionMode ?? settings.permissionMode ?? 'auto',
     allow: settings.allow,
     hooks: settings.hooks,
@@ -128,7 +128,7 @@ async function runReplCommand(replArgs: string[]): Promise<void> {
   try {
     await runRepl({
       workspaceRoot: root,
-      effort: parsed.effort ?? 'normal',
+      effort: parsed.effort ?? 'medium',
       allow: settings.allow,
       hooks: settings.hooks,
       extraTools: mcp.tools,
@@ -147,7 +147,7 @@ async function runTuiCommand(tuiArgs: string[]): Promise<void> {
   try {
     await startTui({
       workspaceRoot: root,
-      effort: parsed.effort ?? 'normal',
+      effort: parsed.effort ?? 'medium',
       // Interactive: default to asking before mutating actions (like Claude Code).
       permissionMode: parsed.permissionMode ?? settings.permissionMode ?? 'default',
       allow: settings.allow,
@@ -213,7 +213,13 @@ async function runDumpContext(contextArgs: string[]): Promise<void> {
 
 async function runEval(evalArgs: string[]): Promise<void> {
   const client = new OllamaClient()
-  const effort: EffortMode = evalArgs.includes('--high') ? 'high' : evalArgs.includes('--medium') ? 'medium' : 'normal'
+  const effort: EffortMode = evalArgs.includes('--x-high')
+    ? 'xhigh'
+    : evalArgs.includes('--high')
+      ? 'high'
+      : evalArgs.includes('--medium')
+        ? 'medium'
+        : 'low'
   const results = await runEvalSuite(client, effort)
   console.log(`effort=${effort}`)
   console.log(summarizeEvalResults(results))
@@ -258,12 +264,14 @@ function parsePromptArgs(values: string[]): {
       const raw = values[index + 1]
       maxTurns = raw ? Number.parseInt(raw, 10) : undefined
       index += 1
-    } else if (value === '--normal') {
-      effort = 'normal'
+    } else if (value === '--low') {
+      effort = 'low'
     } else if (value === '--medium') {
       effort = 'medium'
     } else if (value === '--high') {
       effort = 'high'
+    } else if (value === '--x-high' || value === '--xhigh') {
+      effort = 'xhigh'
     } else if (value === '--plan') {
       permissionMode = 'plan'
     } else if (value === '--accept-edits') {
@@ -310,7 +318,7 @@ Commands:
   dump-context         Print repo map and retrieved snippets for a query
   eval [--high]        Run the local eval suite and print success metrics
 
-Effort flags (agent/tui):     --normal  --medium  --high   (VibeThinker reasons; high adds reviewers)
+Effort flags (agent/tui):     --low  --medium  --high  --xhigh   (deeper reasoning; high/xhigh add reviewers)
 Permission flags (agent/tui): --plan  --accept-edits  --auto  --ask
 
 Examples:

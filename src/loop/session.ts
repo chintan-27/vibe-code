@@ -1,3 +1,5 @@
+import { access } from 'fs/promises'
+import { isAbsolute, join } from 'path'
 import { compactMessages, estimateTokens } from '@/compact/compact.ts'
 import { dumpContext } from '@/context/budget.ts'
 import { loadMemories, renderMemoryPrompt, selectRelevantMemories } from '@/memory/memdir.ts'
@@ -5,6 +7,7 @@ import { loadProjectInstructions } from '@/prompt/instructions.ts'
 import { buildSystemPrompt } from '@/prompt/system.ts'
 import { getModelProfile } from '@/provider/models.ts'
 import type { ChatMessage } from '@/provider/types.ts'
+import { describeImage } from '@/vision/describe.ts'
 import { parseToolCalls, stripThinkBlocks } from '@/toolcall/parse.ts'
 import { validateToolCalls, type ValidToolCall } from '@/toolcall/validate.ts'
 import { coreTools, toolMap } from '@/tools/registry.ts'
@@ -64,7 +67,7 @@ export class AgentSession {
     this.workspaceRoot = options.workspaceRoot
     this.tools = options.tools ?? coreTools
     this.toolsByName = toolMap(this.tools)
-    this.effort = options.effort ?? 'normal'
+    this.effort = options.effort ?? 'low'
     this.maxTurns = options.maxTurns ?? 12
     this.contextTokenBudget = options.contextTokenBudget ?? 12_000
     this.spawnDepth = options.spawnDepth ?? 0
@@ -81,7 +84,8 @@ export class AgentSession {
 
   async run(userInput: string): Promise<AgentLoopResult> {
     await this.refreshSystemMessage(userInput)
-    this.messages.push({ role: 'user', content: userInput })
+    const withImages = await this.attachImages(userInput)
+    this.messages.push({ role: 'user', content: withImages })
 
     const profile = getModelProfile('coder')
     const context: ToolContext = {
@@ -198,6 +202,40 @@ export class AgentSession {
     })
   }
 
+  /**
+   * If the user's message references image paths, describe them up front via the
+   * vision model and inline the descriptions — so the model never has to "decide"
+   * to look (and can't claim it can't see images). User-initiated, so not gated.
+   */
+  private async attachImages(userInput: string): Promise<string> {
+    const matches = [...userInput.matchAll(/(?:[^\s\\]|\\ )+\.(?:png|jpe?g|gif|webp|bmp)/gi)].map(m =>
+      m[0].replace(/\\ /g, ' ').replace(/^["']|["']$/g, ''),
+    )
+    const unique = [...new Set(matches)].slice(0, 3)
+    if (unique.length === 0) return userInput
+
+    const notes: string[] = []
+    for (const path of unique) {
+      const abs = isAbsolute(path) ? path : join(this.workspaceRoot, path)
+      try {
+        await access(abs)
+      } catch {
+        continue // not a real file on disk
+      }
+      this.events?.onTool?.('ViewImage', { file_path: path })
+      try {
+        const description = await describeImage(this.client, abs)
+        this.events?.onToolResult?.('ViewImage', true, description)
+        notes.push(`\n\n[Attached image — ${path}]\n${description}`)
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        this.events?.onToolResult?.('ViewImage', false, msg)
+        notes.push(`\n\n[Attached image — ${path}] (could not be read: ${msg})`)
+      }
+    }
+    return userInput + notes.join('')
+  }
+
   /** Rebuild the system message with context/memory relevant to the latest request. */
   private async refreshSystemMessage(userInput: string): Promise<void> {
     const instructionEntries = await loadProjectInstructions(this.workspaceRoot)
@@ -284,6 +322,7 @@ function previewChange(toolName: string, input: unknown): string {
     return `${str(rec.file_path)}  (${content.length} chars)\n${truncate(content, 400)}`
   }
   if (toolName === 'Bash') return `$ ${str(rec.command)}`
+  if (toolName === 'Read') return `read ${str(rec.file_path)}`
   return truncate(JSON.stringify(input), 300)
 }
 

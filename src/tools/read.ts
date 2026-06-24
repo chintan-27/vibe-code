@@ -1,4 +1,5 @@
 import { readFile } from 'fs/promises'
+import { isAbsolute } from 'path'
 import { z } from 'zod'
 import { describeImage, isImagePath } from '@/vision/describe.ts'
 import { resolveWorkspacePath } from './path.ts'
@@ -8,15 +9,20 @@ const MAX_READ_CHARS = 80_000
 
 export const readTool = {
   name: 'Read',
-  description: 'Read a file from the workspace. Text files return their content; image files (png/jpg/…) return a vision-model description.',
-  readOnly: true,
+  description: 'Read a file by path (absolute paths allowed, e.g. a screenshot in /tmp). Text files return their content; image files (png/jpg/…) return a vision-model description.',
+  // Gated like a mutating tool: Read can open any absolute path, so it asks for
+  // permission unless the user has allowed it (allow-always / settings / auto mode).
+  readOnly: false,
   schema: z.object({
     file_path: z.string().min(1),
     offset: z.number().int().min(1).optional(),
     limit: z.number().int().min(1).max(2000).optional(),
   }),
   async execute(input, context) {
-    const filePath = resolveWorkspacePath(context.workspaceRoot, input.file_path)
+    // Read is read-only, so absolute paths (dragged screenshots, /tmp files) are allowed;
+    // relative paths stay workspace-guarded. Un-escape "\ " that terminals insert on drag.
+    const requested = input.file_path.replace(/\\ /g, ' ')
+    const filePath = isAbsolute(requested) ? requested : resolveWorkspacePath(context.workspaceRoot, requested)
 
     if (isImagePath(filePath)) {
       if (!context.client) return { ok: false, content: 'Cannot read an image without a model client.' }
