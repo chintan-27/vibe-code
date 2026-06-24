@@ -1,0 +1,31 @@
+{
+  "name": "vibe-code",
+  "version": "0.0.0",
+  "description": "A Claude-Code-class coding agent running on local models via ollama (VibeThinker + qwen2.5-coder)",
+  "type": "module",
+  "module": "src/cli/main.ts",
+  "bin": {
+    "vibe": "src/cli/main.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/cli/main.ts",
+    "ping": "bun run src/cli/main.ts ping",
+    "repl": "bun run src/cli/main.ts repl",
+    "tui": "bun run src/cli/main.ts tui",
+    "eval": "bun run src/cli/main.ts eval",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "ink": "^5.1.0",
+    "react": "^18.3.1",
+    "unpdf": "^1.6.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^18.3.12",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}
