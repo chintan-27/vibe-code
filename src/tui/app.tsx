@@ -10,6 +10,10 @@ import type {
   PlannedAction,
   SessionEvents,
 } from '@/loop/types.ts'
+import { copyFileSync, existsSync, mkdirSync } from 'fs'
+import { basename, dirname, join } from 'path'
+import { tmpdir } from 'os'
+import { isTrusted, trustDir } from '@/config/trust.ts'
 import { getModelProfile } from '@/provider/models.ts'
 import { OllamaClient } from '@/provider/ollama.ts'
 import { stripThinkBlocks } from '@/toolcall/parse.ts'
@@ -51,6 +55,28 @@ const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', 
 const PASTE_GAP_MS = 45 // a return arriving this soon after a keystroke is a pasted newline, not submit
 function freshLive(): Live {
   return { active: false, assistant: '', think: '', tools: [] }
+}
+
+const IMG_RE = /(?:'[^'\n]+\.(?:png|jpe?g|gif|webp|bmp)'|"[^"\n]+\.(?:png|jpe?g|gif|webp|bmp)"|(?:[^\s'"]|\\ )+\.(?:png|jpe?g|gif|webp|bmp))/gi
+
+/**
+ * When an image path is dragged/pasted in, copy it to a stable location *immediately* —
+ * macOS deletes screenshot temp files (NSIRD_screencaptureui) within seconds, so by the
+ * time the turn runs the original is gone. Replaces the path with the durable copy.
+ */
+function capturePastedImages(text: string): string {
+  return text.replace(IMG_RE, match => {
+    const clean = match.replace(/^['"]|['"]$/g, '').replace(/\\ /g, ' ')
+    try {
+      if (!existsSync(clean)) return match
+      const dest = join(tmpdir(), 'vibe-attachments', `${Date.now()}-${basename(clean)}`)
+      mkdirSync(dirname(dest), { recursive: true })
+      copyFileSync(clean, dest)
+      return dest
+    } catch {
+      return match
+    }
+  })
 }
 
 // --- design system: one palette + glyph set used across every component ---
@@ -104,6 +130,7 @@ export function App({ options }: { options: TuiOptions }) {
   const dirtyRef = useRef(false)
   const tokensRef = useRef(0)
   const turnStartRef = useRef(0)
+  const abortRef = useRef<AbortController | null>(null)
   const [context, setContext] = useState<ContextInfo>({ files: [], approxTokens: 0 })
   const [tokensThisTurn, setTokensThisTurn] = useState(0)
   const [tokPerSec, setTokPerSec] = useState(0)
@@ -120,7 +147,10 @@ export function App({ options }: { options: TuiOptions }) {
   const [permMode, setPermMode] = useState<PermissionMode>(options.permissionMode)
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null)
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null)
+  const [qIndex, setQIndex] = useState(0) // highlighted option in a question prompt
+  const [qTyping, setQTyping] = useState(false) // chose "type my own answer"
   const [frame, setFrame] = useState(0)
+  const [trusted, setTrusted] = useState(() => isTrusted(options.workspaceRoot))
   const idRef = useRef(0)
   const nextId = () => (idRef.current += 1)
 
@@ -188,7 +218,11 @@ export function App({ options }: { options: TuiOptions }) {
       onPermissionRequest: request =>
         new Promise<PermissionDecision>(resolve => setPendingPermission({ request, resolve })),
       onAskUser: (question, options2) =>
-        new Promise<string>(resolve => setPendingQuestion({ question, options: options2, resolve })),
+        new Promise<string>(resolve => {
+          setQIndex(0)
+          setQTyping(false)
+          setPendingQuestion({ question, options: options2, resolve })
+        }),
       onPlan: actions => setTranscript(prev => [...prev, { kind: 'plan', id: nextId(), actions }]),
     }
     sessionRef.current = new AgentSession({
@@ -228,18 +262,26 @@ export function App({ options }: { options: TuiOptions }) {
     tokensRef.current = 0
     dirtyRef.current = false
     turnStartRef.current = Date.now()
+    const controller = new AbortController()
+    abortRef.current = controller
     setLive({ active: true, assistant: '', think: '', tools: [] })
     setTokensThisTurn(0)
 
     let result
     try {
-      result = await session.run(text)
+      result = await session.run(text, controller.signal)
     } catch (error) {
-      setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `Error: ${asMessage(error)}` }])
+      const stopped = controller.signal.aborted || /abort/i.test(asMessage(error))
+      setTranscript(prev => [
+        ...prev,
+        { kind: 'note', id: nextId(), text: stopped ? '⊘ Stopped.' : `Error: ${asMessage(error)}` },
+      ])
       liveRef.current = freshLive()
       setLive(freshLive())
+      abortRef.current = null
       return
     }
+    abortRef.current = null
 
     // Finalize the live turn into scrollback blocks.
     const current = liveRef.current
@@ -272,7 +314,11 @@ export function App({ options }: { options: TuiOptions }) {
       onSubmit(text)
       return
     }
-    if (value && !key.ctrl && !key.meta) insertText(value)
+    if (value && !key.ctrl && !key.meta) {
+      // On a paste containing an image path, durably copy it before macOS deletes the temp.
+      const text = value.length > 3 && /\.(png|jpe?g|gif|webp|bmp)/i.test(value) ? capturePastedImages(value) : value
+      insertText(text)
+    }
   }
 
   const runInputLine = (raw: string) => {
@@ -314,7 +360,19 @@ export function App({ options }: { options: TuiOptions }) {
 
   useInput((value, key) => {
     if (key.ctrl && value === 'c') {
-      exit()
+      // While a turn is running, ^C interrupts it; when idle, it quits.
+      if (live.active && abortRef.current) abortRef.current.abort()
+      else exit()
+      return
+    }
+    // Workspace trust gate: nothing else runs until the folder is trusted.
+    if (!trusted) {
+      if (value === 'y' || value === 'Y') {
+        trustDir(options.workspaceRoot)
+        setTrusted(true)
+      } else if (value === 'n' || value === 'N' || key.escape) {
+        exit()
+      }
       return
     }
     // A pending permission prompt captures single keys, even mid-turn.
@@ -324,13 +382,28 @@ export function App({ options }: { options: TuiOptions }) {
       else if (value === 'n' || key.escape) resolvePermission('deny')
       return
     }
-    // A pending clarifying question captures a typed line, even mid-turn.
+    // A pending clarifying question: arrow-select options, or type a custom answer.
     if (pendingQuestion) {
-      editText(value, key, answer => {
+      const resolveQuestion = (answer: string) => {
         pendingQuestion.resolve(answer.trim())
         setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `↳ ${answer.trim() || '(skipped)'}` }])
         setPendingQuestion(null)
-      })
+        setQTyping(false)
+        setQIndex(0)
+      }
+      const options = pendingQuestion.options ?? []
+      if (options.length > 0 && !qTyping) {
+        const total = options.length + 1 // options + "type my own answer"
+        if (key.upArrow) return setQIndex(i => (i - 1 + total) % total)
+        if (key.downArrow) return setQIndex(i => (i + 1) % total)
+        if (key.return) {
+          if (qIndex === options.length) setQTyping(true) // chose "type my own"
+          else resolveQuestion(options[qIndex] ?? '')
+          return
+        }
+        return // ignore other keys while selecting
+      }
+      editText(value, key, resolveQuestion)
       return
     }
     if (key.ctrl && value === 'r') {
@@ -339,6 +412,11 @@ export function App({ options }: { options: TuiOptions }) {
     }
     if (key.ctrl && value === 'o') {
       setShowContext(s => !s)
+      return
+    }
+    // Esc interrupts the running turn (model + tools abort, back to the prompt).
+    if (live.active && key.escape) {
+      abortRef.current?.abort()
       return
     }
     if (live.active) return // ignore editing while a turn runs
@@ -367,6 +445,16 @@ export function App({ options }: { options: TuiOptions }) {
   })
 
   const elapsedS = live.active ? Math.max(0, Math.round((Date.now() - turnStartRef.current) / 1000)) : 0
+
+  // Trust gate — shown until the workspace is approved.
+  if (!trusted) {
+    return (
+      <Box flexDirection="column" width={width}>
+        <BannerView model={profile.model} workspace={options.workspaceRoot} effort={effort} width={width} />
+        <TrustGate workspace={options.workspaceRoot} width={width} />
+      </Box>
+    )
+  }
 
   return (
     <Box flexDirection="column" width={width}>
@@ -402,12 +490,23 @@ export function App({ options }: { options: TuiOptions }) {
           <Box marginTop={1}>
             <Text color={C.brandBright}>{`${SPINNER[frame]} `}</Text>
             <Text color={C.muted}>{`${spinnerLabel(live)}  ${elapsedS}s`}</Text>
+            <Text color={C.muted} dimColor>
+              {'   ·  esc to stop'}
+            </Text>
           </Box>
         </Box>
       )}
 
       {pendingPermission && <PermissionPrompt request={pendingPermission.request} width={width} />}
-      {pendingQuestion && <QuestionPrompt question={pendingQuestion.question} options={pendingQuestion.options} width={width} />}
+      {pendingQuestion && (
+        <QuestionPrompt
+          question={pendingQuestion.question}
+          options={pendingQuestion.options}
+          selected={qIndex}
+          typing={qTyping}
+          width={width}
+        />
+      )}
 
       <StatusBar
         effort={effort}
@@ -762,6 +861,31 @@ function meter(pct: number, width: number): string {
   return '▰'.repeat(filled) + '▱'.repeat(Math.max(0, width - filled))
 }
 
+function TrustGate({ workspace, width }: { workspace: string; width: number }) {
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={C.warn} paddingX={1} width={width} marginTop={1}>
+      <Text color={C.warn} bold>
+        Do you trust the files in this folder?
+      </Text>
+      <Text color={C.muted}>{`  ${workspace}`}</Text>
+      <Text color={C.muted}>
+        {'  Vibe Code will read and index files here, and may run shell commands.'}
+      </Text>
+      <Text color={C.muted}>{'  Only proceed if you trust this folder.'}</Text>
+      <Box marginTop={1}>
+        <Text color={C.ok} bold>
+          {' [y] '}
+        </Text>
+        <Text color={C.muted}>yes, trust it </Text>
+        <Text color={C.err} bold>
+          {' [n] '}
+        </Text>
+        <Text color={C.muted}>no, quit</Text>
+      </Box>
+    </Box>
+  )
+}
+
 function PermissionPrompt({ request, width }: { request: PermissionRequest; width: number }) {
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={C.warn} paddingX={1} width={width} marginTop={1}>
@@ -792,7 +916,21 @@ function PermissionPrompt({ request, width }: { request: PermissionRequest; widt
   )
 }
 
-function QuestionPrompt({ question, options, width }: { question: string; options?: string[]; width: number }) {
+export function QuestionPrompt({
+  question,
+  options,
+  selected,
+  typing,
+  width,
+}: {
+  question: string
+  options?: string[]
+  selected: number
+  typing: boolean
+  width: number
+}) {
+  const opts = options ?? []
+  const hasOptions = opts.length > 0
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={C.accent} paddingX={1} width={width} marginTop={1}>
       <Box>
@@ -803,11 +941,31 @@ function QuestionPrompt({ question, options, width }: { question: string; option
           {question}
         </Text>
       </Box>
-      {options && options.length > 0 ? <Text color={C.muted}>{`  options: ${options.join(' · ')}`}</Text> : null}
-      <Text color={C.muted} dimColor>
-        {'  type your answer below, then Enter ↵'}
-      </Text>
+      {hasOptions && !typing ? (
+        <Box flexDirection="column" marginTop={1}>
+          {opts.map((opt, i) => (
+            <Option key={`opt-${i}`} label={opt} active={selected === i} />
+          ))}
+          <Option label="✎ Type my own answer…" active={selected === opts.length} />
+          <Text color={C.muted} dimColor>
+            {'  ↑/↓ select · ↵ choose'}
+          </Text>
+        </Box>
+      ) : (
+        <Text color={C.muted} dimColor>
+          {'  type your answer below, then Enter ↵'}
+        </Text>
+      )}
     </Box>
+  )
+}
+
+function Option({ label, active }: { label: string; active: boolean }) {
+  return (
+    <Text color={active ? C.accentBright : C.muted} bold={active}>
+      {active ? '❯ ' : '  '}
+      {label}
+    </Text>
   )
 }
 

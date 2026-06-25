@@ -1,10 +1,14 @@
+import type { Dirent } from 'fs'
 import { readFile, readdir } from 'fs/promises'
 import { join } from 'path'
 import { z } from 'zod'
 import { resolveWorkspacePath, toWorkspaceRelative } from './path.ts'
 import type { ToolDef } from './types.ts'
 
-const SKIP_DIRS = new Set(['.git', 'node_modules', 'claude-code'])
+const SKIP_DIRS = new Set([
+  'node_modules', 'claude-code', 'dist', 'build', 'vendor', 'target',
+  'Library', 'Applications', 'CloudStorage', 'OneDrive', 'Dropbox', '__pycache__',
+])
 
 export const grepTool = {
   name: 'Grep',
@@ -37,8 +41,14 @@ export const grepTool = {
 } satisfies ToolDef
 
 async function walk(dir: string, visit: (file: string) => Promise<boolean>): Promise<boolean> {
-  const entries = await readdir(dir, { withFileTypes: true })
+  let entries: Dirent[]
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch {
+    return true // unreadable directory (permissions / cloud timeout) — skip, keep going
+  }
   for (const entry of entries) {
+    if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue
     if (entry.isDirectory() && SKIP_DIRS.has(entry.name)) continue
     const fullPath = join(dir, entry.name)
     if (entry.isDirectory()) {

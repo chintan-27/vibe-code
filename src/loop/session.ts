@@ -82,7 +82,7 @@ export class AgentSession {
     this.messages = []
   }
 
-  async run(userInput: string): Promise<AgentLoopResult> {
+  async run(userInput: string, signal?: AbortSignal): Promise<AgentLoopResult> {
     await this.refreshSystemMessage(userInput)
     const withImages = await this.attachImages(userInput)
     this.messages.push({ role: 'user', content: withImages })
@@ -93,6 +93,7 @@ export class AgentSession {
       client: this.client,
       spawnDepth: this.spawnDepth,
       askUser: this.events?.onAskUser,
+      signal,
     }
     let toolCalls = 0
     let validToolCalls = 0
@@ -116,7 +117,7 @@ export class AgentSession {
         compactions += 1
       }
 
-      const content = await this.generate()
+      const content = await this.generate(signal)
 
       const step = await this.resolveStep(stripThinkBlocks(content))
       this.messages.push({ role: 'assistant', content: step.assistant })
@@ -193,12 +194,13 @@ export class AgentSession {
    * qwen extracts the structured action (see runTwoPhaseStep). Effort controls
    * how much VibeThinker reasons and whether reviewers run.
    */
-  private async generate(): Promise<string> {
+  private async generate(signal?: AbortSignal): Promise<string> {
     return runTwoPhaseStep(this.client, this.messages, {
       effort: this.effort,
       onThink: this.events?.onThink,
       onToken: this.events?.onToken,
       onUsage: this.events?.onUsage,
+      signal,
     })
   }
 
@@ -208,10 +210,7 @@ export class AgentSession {
    * to look (and can't claim it can't see images). User-initiated, so not gated.
    */
   private async attachImages(userInput: string): Promise<string> {
-    const matches = [...userInput.matchAll(/(?:[^\s\\]|\\ )+\.(?:png|jpe?g|gif|webp|bmp)/gi)].map(m =>
-      m[0].replace(/\\ /g, ' ').replace(/^["']|["']$/g, ''),
-    )
-    const unique = [...new Set(matches)].slice(0, 3)
+    const unique = extractImagePaths(userInput).slice(0, 3)
     if (unique.length === 0) return userInput
 
     const notes: string[] = []
@@ -220,7 +219,13 @@ export class AgentSession {
       try {
         await access(abs)
       } catch {
-        continue // not a real file on disk
+        // Common case: a macOS screenshot temp (NSIRD_screencaptureui) already deleted.
+        this.events?.onTool?.('ViewImage', { file_path: path })
+        this.events?.onToolResult?.('ViewImage', false, 'file not found (a temporary screenshot may have been deleted)')
+        notes.push(
+          `\n\n[image — ${path}] could not be found. If this was a macOS screenshot, it was likely a temporary preview that has been deleted — save it to disk (e.g. drag it from your Desktop) and try again.`,
+        )
+        continue
       }
       this.events?.onTool?.('ViewImage', { file_path: path })
       try {
@@ -238,9 +243,14 @@ export class AgentSession {
 
   /** Rebuild the system message with context/memory relevant to the latest request. */
   private async refreshSystemMessage(userInput: string): Promise<void> {
-    const instructionEntries = await loadProjectInstructions(this.workspaceRoot)
-    const relevantMemories = selectRelevantMemories(await loadMemories(this.workspaceRoot), userInput)
-    const contextDump = await dumpContext(this.workspaceRoot, userInput, this.contextTokenBudget)
+    const instructionEntries = await loadProjectInstructions(this.workspaceRoot).catch(() => [])
+    const relevantMemories = selectRelevantMemories(await loadMemories(this.workspaceRoot).catch(() => []), userInput)
+    // Never let a slow/huge/unreadable tree (e.g. running from $HOME) crash the turn.
+    const contextDump = await dumpContext(this.workspaceRoot, userInput, this.contextTokenBudget).catch(() => ({
+      content: '[workspace context unavailable]',
+      approxTokens: 0,
+      files: [] as string[],
+    }))
     this.events?.onContext?.({ files: contextDump.files, approxTokens: contextDump.approxTokens })
     const system: ChatMessage = {
       role: 'system',
@@ -308,6 +318,34 @@ type StepResolution = {
 function renderInstructionContext(entries: Awaited<ReturnType<typeof loadProjectInstructions>>): string {
   if (entries.length === 0) return '# Local Instructions\n[none]'
   return ['# Local Instructions', ...entries.map(entry => `## ${entry.path}\n${entry.content.slice(0, 8000)}`)].join('\n\n')
+}
+
+const IMG_EXT = '(?:png|jpe?g|gif|webp|bmp)'
+
+/**
+ * Find image paths in a user message, tolerant of spaces. Handles quoted paths,
+ * absolute/relative paths that contain spaces (up to the extension), and plain
+ * no-space tokens. Drag-and-drop "\ " escapes are normalized.
+ */
+export function extractImagePaths(text: string): string[] {
+  const found: string[] = []
+  const push = (p?: string) => {
+    if (p) found.push(p.replace(/\\ /g, ' ').replace(/^['"]|['"]$/g, '').trim())
+  }
+  // 1) quoted: '…/a b.png' or "…/a b.png"
+  for (const m of text.matchAll(new RegExp(`['"]([^'"\\n]+\\.${IMG_EXT})['"]`, 'gi'))) push(m[1])
+  // 2) path starting with / ~/ ./ ../ or C:\ , allowing spaces, up to the extension
+  for (const m of text.matchAll(
+    new RegExp(`(?:^|\\s)((?:/|~/|\\.{1,2}/|[A-Za-z]:[\\\\/])[^\\n]*?\\.${IMG_EXT})(?=\\s|$)`, 'gi'),
+  ))
+    push(m[1])
+  // 3) plain no-space token ending in an image extension (e.g. shot.png)
+  for (const m of text.matchAll(new RegExp(`(?:^|\\s)([^\\s'"]+\\.${IMG_EXT})(?=\\s|$)`, 'gi'))) push(m[1])
+  // Drop fragments that are just the tail of a longer matched path (e.g. "PM.png").
+  const sorted = [...new Set(found)].sort((a, b) => b.length - a.length)
+  const result: string[] = []
+  for (const p of sorted) if (!result.some(r => r.endsWith(p))) result.push(p)
+  return result
 }
 
 /** Human-readable preview of a mutating tool call, for the approval prompt. */

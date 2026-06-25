@@ -1,11 +1,21 @@
+import { mkdtemp } from 'fs/promises'
+import { join } from 'path'
 import { tmpdir } from 'os'
-import { describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { render } from 'ink-testing-library'
-import { App } from './app.tsx'
+import { App, QuestionPrompt } from './app.tsx'
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 describe('TUI App', () => {
+  // Bypass the workspace-trust gate for the main UI tests.
+  beforeAll(() => {
+    process.env.VIBE_TRUST_ALL = '1'
+  })
+  afterAll(() => {
+    delete process.env.VIBE_TRUST_ALL
+  })
+
   test('renders the status bar, model, and input prompt on mount', () => {
     const { lastFrame, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
     const frame = lastFrame() ?? ''
@@ -62,5 +72,47 @@ describe('TUI App', () => {
     await delay(50)
     expect(lastFrame() ?? '').toContain('Commands:')
     unmount()
+  })
+})
+
+describe('QuestionPrompt', () => {
+  test('renders selectable options with a highlight and a custom-answer choice', () => {
+    const { lastFrame } = render(
+      <QuestionPrompt question="Which framework?" options={['React', 'Vue']} selected={1} typing={false} width={70} />,
+    )
+    const frame = lastFrame() ?? ''
+    expect(frame).toContain('Which framework?')
+    expect(frame).toContain('React')
+    expect(frame).toContain('Vue')
+    expect(frame).toContain('Type my own answer')
+    expect(frame).toContain('❯') // highlight marker on the selected option
+  })
+
+  test('typing mode shows the free-text hint instead of the list', () => {
+    const { lastFrame } = render(
+      <QuestionPrompt question="Name?" options={['A']} selected={1} typing width={70} />,
+    )
+    expect(lastFrame() ?? '').toContain('type your answer below')
+  })
+})
+
+describe('TUI trust gate', () => {
+  test('prompts for an untrusted folder and unlocks on y', async () => {
+    delete process.env.VIBE_TRUST_ALL
+    const cfg = await mkdtemp(join(tmpdir(), 'vibe-cfg-'))
+    process.env.VIBE_CONFIG_DIR = cfg
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-untrusted-'))
+    const { lastFrame, stdin, unmount } = render(
+      <App options={{ workspaceRoot: ws, effort: 'medium', permissionMode: 'auto' }} />,
+    )
+    await delay(50)
+    expect(lastFrame() ?? '').toContain('Do you trust')
+    stdin.write('y')
+    await delay(60)
+    const frame = lastFrame() ?? ''
+    expect(frame).not.toContain('Do you trust')
+    expect(frame).toContain('❯') // main input is now shown
+    unmount()
+    delete process.env.VIBE_CONFIG_DIR
   })
 })

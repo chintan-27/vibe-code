@@ -50,6 +50,21 @@ describe('dependency graph', () => {
     // util.ts is imported by two files; it should outrank its importers.
     expect((ranks.get('src/util.ts') ?? 0)).toBeGreaterThan(ranks.get('src/a.ts') ?? 0)
   })
+
+  test('skips node_modules, hidden, and cloud/system directories', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-walk-'))
+    await mkdir(join(ws, 'src'))
+    await mkdir(join(ws, 'node_modules', 'pkg'), { recursive: true })
+    await mkdir(join(ws, '.hidden'))
+    await mkdir(join(ws, 'Library'))
+    await writeFile(join(ws, 'src', 'keep.ts'), 'export const a = 1\n', 'utf8')
+    await writeFile(join(ws, 'node_modules', 'pkg', 'skip.ts'), 'export const b = 2\n', 'utf8')
+    await writeFile(join(ws, '.hidden', 'skip.ts'), 'export const c = 3\n', 'utf8')
+    await writeFile(join(ws, 'Library', 'skip.ts'), 'export const d = 4\n', 'utf8')
+
+    const graph = await buildDependencyGraph(ws)
+    expect(graph.files).toEqual(['src/keep.ts'])
+  })
 })
 
 describe('retrieveSnippets', () => {

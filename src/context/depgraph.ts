@@ -1,9 +1,17 @@
+import type { Dirent } from 'fs'
 import { readFile, readdir, stat } from 'fs/promises'
 import { extname, join, relative } from 'path'
 import { dirname, resolve as posixResolve } from 'path/posix'
 
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'])
-const SKIP_DIRS = new Set(['.git', 'node_modules', 'claude-code', 'dist', 'build', '.next'])
+// Hidden dirs (names starting with '.') are always skipped; these are extra non-hidden
+// directories that are huge or cloud-backed and would stall/swamp a scan (esp. from $HOME).
+const SKIP_DIRS = new Set([
+  'node_modules', 'claude-code', 'dist', 'build', 'vendor', 'target',
+  'Library', 'Applications', 'CloudStorage', 'OneDrive', 'Dropbox', '__pycache__',
+])
+const MAX_DEPTH = 12
+const MAX_FILES = 5_000
 const IMPORT_PATTERN =
   /\bimport\s+(?:[^'"]+\s+from\s+)?['"]([^'"]+)['"]|\bexport\s+(?:[^'"]+\s+from\s+)?['"]([^'"]+)['"]|\brequire\(['"]([^'"]+)['"]\)|\bimport\(['"]([^'"]+)['"]\)/g
 // Candidate suffixes tried when resolving an extensionless import specifier.
@@ -103,21 +111,35 @@ export function pageRank(graph: DependencyGraph, damping = 0.85, iterations = 30
 
 async function listSourceFiles(root: string): Promise<string[]> {
   const out: string[] = []
-  await walk(root, async path => {
-    if (SOURCE_EXTENSIONS.has(extname(path))) out.push(relative(root, path).split('\\').join('/'))
+  await walk(root, 0, async path => {
+    if (out.length < MAX_FILES && SOURCE_EXTENSIONS.has(extname(path))) {
+      out.push(relative(root, path).split('\\').join('/'))
+    }
   })
   return out.sort()
 }
 
-async function walk(dir: string, visit: (file: string) => Promise<void>): Promise<void> {
-  const entries = await readdir(dir, { withFileTypes: true })
+async function walk(dir: string, depth: number, visit: (file: string) => Promise<void>): Promise<void> {
+  if (depth > MAX_DEPTH) return
+  let entries: Dirent[]
+  try {
+    entries = await readdir(dir, { withFileTypes: true })
+  } catch {
+    return // unreadable / permission denied / cloud timeout — skip this directory
+  }
   for (const entry of entries) {
-    if (entry.isDirectory() && SKIP_DIRS.has(entry.name)) continue
+    // Skip hidden (.git/.Trash/.cache/.venv/.next/…) and symlinks (cloud-link loops/timeouts).
+    if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue
     const fullPath = join(dir, entry.name)
     if (entry.isDirectory()) {
-      await walk(fullPath, visit)
-    } else if (entry.isFile() && (await stat(fullPath)).size < 500_000) {
-      await visit(fullPath)
+      if (SKIP_DIRS.has(entry.name)) continue
+      await walk(fullPath, depth + 1, visit)
+    } else if (entry.isFile()) {
+      try {
+        if ((await stat(fullPath)).size < 500_000) await visit(fullPath)
+      } catch {
+        // unreadable file — skip
+      }
     }
   }
 }

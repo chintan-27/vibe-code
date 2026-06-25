@@ -13,6 +13,7 @@ export type TwoPhaseOptions = {
   onThink?: (text: string) => void
   onToken?: (text: string) => void
   onUsage?: (usage: TurnUsage) => void
+  signal?: AbortSignal
 }
 
 /**
@@ -34,7 +35,7 @@ export async function runTwoPhaseStep(
   if (opts.effort === 'low') return directExtract(client, extractor.model, messages, opts)
 
   // MEDIUM — dynamic: reason only when the request looks like it needs it.
-  if (opts.effort === 'medium' && !(await needsThinking(client, messages, opts.onThink))) {
+  if (opts.effort === 'medium' && !(await needsThinking(client, messages, opts.signal, opts.onThink))) {
     return directExtract(client, extractor.model, messages, opts)
   }
 
@@ -47,7 +48,7 @@ export async function runTwoPhaseStep(
     client,
     reasoner.model,
     messages,
-    { ...reasoner.defaults, maxTokens: REASON_TOKENS[opts.effort] },
+    { ...reasoner.defaults, maxTokens: REASON_TOKENS[opts.effort], signal: opts.signal },
     opts.onThink,
   )
   const conclusion = stripThinkBlocks(reasoning) || reasoning.trim()
@@ -56,7 +57,7 @@ export async function runTwoPhaseStep(
   // xhigh always includes gemma; high includes it only if VIBE_REVIEW_GEMMA=1.
   const review =
     opts.effort === 'high' || opts.effort === 'xhigh'
-      ? await overlook(client, recent, conclusion, opts.effort === 'xhigh', opts.onThink)
+      ? await overlook(client, recent, conclusion, opts.effort === 'xhigh', opts.signal, opts.onThink)
       : ''
 
   // Phase 3 — qwen extracts the structured action (streamed to the answer area).
@@ -73,7 +74,7 @@ export async function runTwoPhaseStep(
         content: `${recent}\n\nReasoning to act on:\n${conclusion}${review ? `\n\nReviewer notes to address:\n${review}` : ''}`,
       },
     ],
-    extractor.defaults,
+    { ...extractor.defaults, signal: opts.signal },
     opts.onToken,
     opts.onUsage,
   )
@@ -88,15 +89,15 @@ function directExtract(
   messages: ChatMessage[],
   opts: TwoPhaseOptions,
 ): Promise<string> {
-  return streamVisible(client, model, messages, getModelProfile('extractor').defaults, opts.onToken, opts.onUsage).then(
-    stripThinkBlocks,
-  )
+  const options = { ...getModelProfile('extractor').defaults, signal: opts.signal }
+  return streamVisible(client, model, messages, options, opts.onToken, opts.onUsage).then(stripThinkBlocks)
 }
 
 /** Quick qwen classification: does this request need step-by-step reasoning? */
 async function needsThinking(
   client: ChatClient,
   messages: ChatMessage[],
+  signal?: AbortSignal,
   onThink?: (text: string) => void,
 ): Promise<boolean> {
   const extractor = getModelProfile('extractor')
@@ -112,7 +113,7 @@ async function needsThinking(
         },
         { role: 'user', content: recent || (messages.at(-1)?.content ?? '') },
       ],
-      { ...extractor.defaults, maxTokens: 8, temperature: 0 },
+      { ...extractor.defaults, maxTokens: 8, temperature: 0, signal },
     )
     const yes = /\byes\b/i.test(stripThinkBlocks(res.content))
     onThink?.(yes ? '[dynamic] reasoning needed\n' : '[dynamic] acting directly\n')
@@ -132,6 +133,7 @@ async function overlook(
   recent: string,
   conclusion: string,
   forceGemma: boolean,
+  signal?: AbortSignal,
   onThink?: (text: string) => void,
 ): Promise<string> {
   const reviewers = [getModelProfile('extractor')]
@@ -150,7 +152,7 @@ async function overlook(
             },
             { role: 'user', content: `Task context:\n${recent}\n\nProposed plan:\n${conclusion}` },
           ],
-          { ...reviewer.defaults, maxTokens: 200 },
+          { ...reviewer.defaults, maxTokens: 200, signal },
         )
         const note = stripThinkBlocks(res.content).trim()
         onThink?.(`\n[review · ${reviewer.role}] ${note}\n`)
