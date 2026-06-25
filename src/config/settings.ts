@@ -14,6 +14,12 @@ export type Settings = {
   allow?: string[]
   hooks?: HooksConfig
   mcpServers?: Record<string, McpServerConfig>
+  /** JSON registry files/URLs used by `/plugins add <id>`. */
+  pluginRegistries?: string[]
+  /** Executable plugin IDs trusted globally/project-locally. */
+  trustedPlugins?: string[]
+  /** Installed plugin IDs disabled by settings. */
+  disabledExtensions?: string[]
 }
 
 const GLOBAL_PATH = join(homedir(), '.config', 'vibe', 'settings.json')
@@ -32,6 +38,9 @@ export function mergeSettings(base: Settings, override: Settings): Settings {
     allow: [...new Set([...(base.allow ?? []), ...(override.allow ?? [])])],
     hooks: { ...base.hooks, ...override.hooks },
     mcpServers: { ...base.mcpServers, ...override.mcpServers },
+    pluginRegistries: [...new Set([...(base.pluginRegistries ?? []), ...(override.pluginRegistries ?? [])])],
+    trustedPlugins: [...new Set([...(base.trustedPlugins ?? []), ...(override.trustedPlugins ?? [])])],
+    disabledExtensions: [...new Set([...(base.disabledExtensions ?? []), ...(override.disabledExtensions ?? [])])],
   }
 }
 

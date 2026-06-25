@@ -15,6 +15,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     permissionMode: options.permissionMode,
     allow: options.allow,
     hooks: options.hooks,
+    extensionSettings: options.extensionSettings,
     events: options.events,
   })
   return session.run(options.prompt)

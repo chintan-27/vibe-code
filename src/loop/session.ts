@@ -1,10 +1,12 @@
 import { access } from 'fs/promises'
 import { isAbsolute, join } from 'path'
 import { compactMessages, estimateTokens } from '@/compact/compact.ts'
-import { dumpContext } from '@/context/budget.ts'
+import { DEFAULT_CONTEXT_TOKEN_BUDGET, dumpContext } from '@/context/budget.ts'
 import { loadMemories, renderMemoryPrompt, selectRelevantMemories } from '@/memory/memdir.ts'
 import { loadProjectInstructions } from '@/prompt/instructions.ts'
 import { buildSystemPrompt } from '@/prompt/system.ts'
+import { renderExtensionInstructions } from '@/plugins/manager.ts'
+import type { PluginSettings } from '@/plugins/manager.ts'
 import { getModelProfile } from '@/provider/models.ts'
 import type { ChatMessage } from '@/provider/types.ts'
 import { describeImage } from '@/vision/describe.ts'
@@ -14,6 +16,7 @@ import { coreTools, toolMap } from '@/tools/registry.ts'
 import type { AnyTool, ToolContext } from '@/tools/types.ts'
 import { type HooksConfig, runHooks } from '@/hooks/hooks.ts'
 import { runTwoPhaseStep } from './twoPhase.ts'
+import { createSessionId, createToolCheckpoint, writeSessionMetadata, type SessionMetadata } from './workflow.ts'
 import type {
   AgentLoopResult,
   ChatClient,
@@ -38,6 +41,7 @@ export type AgentSessionOptions = {
   allow?: string[]
   /** Shell hooks run around tool execution (from settings.json). */
   hooks?: HooksConfig
+  extensionSettings?: PluginSettings
 }
 
 /**
@@ -58,6 +62,9 @@ export class AgentSession {
   private readonly events?: SessionEvents
   private readonly permissionMode: PermissionMode
   private readonly hooks?: HooksConfig
+  private readonly extensionSettings?: PluginSettings
+  private readonly sessionId = createSessionId()
+  private readonly startedAt = new Date().toISOString()
   /** Tools the user approved "always" for this session ("don't ask again"). */
   private readonly allowRules = new Set<string>()
   private messages: ChatMessage[] = []
@@ -69,11 +76,12 @@ export class AgentSession {
     this.toolsByName = toolMap(this.tools)
     this.effort = options.effort ?? 'low'
     this.maxTurns = options.maxTurns ?? 12
-    this.contextTokenBudget = options.contextTokenBudget ?? 12_000
+    this.contextTokenBudget = options.contextTokenBudget ?? DEFAULT_CONTEXT_TOKEN_BUDGET
     this.spawnDepth = options.spawnDepth ?? 0
     this.events = options.events
     this.permissionMode = options.permissionMode ?? 'auto'
     this.hooks = options.hooks
+    this.extensionSettings = options.extensionSettings
     for (const tool of options.allow ?? []) this.allowRules.add(tool)
   }
 
@@ -83,6 +91,7 @@ export class AgentSession {
   }
 
   async run(userInput: string, signal?: AbortSignal): Promise<AgentLoopResult> {
+    await this.writeMetadata(userInput, 'turn started')
     await this.refreshSystemMessage(userInput)
     const withImages = await this.attachImages(userInput)
     this.messages.push({ role: 'user', content: withImages })
@@ -138,6 +147,13 @@ export class AgentSession {
       for (const call of step.calls) {
         const gate = await this.gate(call.tool, call.input, planned)
         if (gate !== 'run') {
+          if (gate.startsWith('User denied') || gate.startsWith('Not executed')) {
+            this.events?.onNotice?.({
+              level: gate.startsWith('User denied') ? 'warn' : 'info',
+              title: gate.startsWith('User denied') ? 'Permission denied' : 'Action skipped',
+              message: gate,
+            })
+          }
           this.messages.push({ role: 'tool', toolName: call.tool.name, content: gate })
           continue
         }
@@ -146,6 +162,14 @@ export class AgentSession {
         if (pre.block) {
           this.messages.push({ role: 'tool', toolName: call.tool.name, content: `Blocked by PreToolUse hook: ${pre.message}` })
           continue
+        }
+        const checkpoint = await createToolCheckpoint(this.workspaceRoot, this.sessionId, turn, call.tool.name, call.input).catch(() => undefined)
+        if (checkpoint) {
+          this.events?.onNotice?.({
+            level: 'info',
+            title: 'Checkpoint saved',
+            message: `${checkpoint.tool} can be rewound for ${checkpoint.touchedFiles.join(', ')}`,
+          })
         }
         this.events?.onTool?.(call.tool.name, call.input)
         const result = await executeToolSafely(call.tool, call.input, context)
@@ -157,6 +181,7 @@ export class AgentSession {
           content: `${result.ok ? 'ok' : 'error'}\n${result.content}`,
         })
       }
+      await this.writeMetadata(userInput, stripThinkBlocks(finalContent).slice(0, 500))
     }
 
     return done('Stopped after reaching max turns.', this.maxTurns)
@@ -200,6 +225,7 @@ export class AgentSession {
       onThink: this.events?.onThink,
       onToken: this.events?.onToken,
       onUsage: this.events?.onUsage,
+      onNotice: this.events?.onNotice,
       signal,
     })
   }
@@ -244,19 +270,34 @@ export class AgentSession {
   /** Rebuild the system message with context/memory relevant to the latest request. */
   private async refreshSystemMessage(userInput: string): Promise<void> {
     const instructionEntries = await loadProjectInstructions(this.workspaceRoot).catch(() => [])
+    const extensionInstructions = await renderExtensionInstructions(this.workspaceRoot, this.extensionSettings).catch(() => '')
     const relevantMemories = selectRelevantMemories(await loadMemories(this.workspaceRoot).catch(() => []), userInput)
     // Never let a slow/huge/unreadable tree (e.g. running from $HOME) crash the turn.
     const contextDump = await dumpContext(this.workspaceRoot, userInput, this.contextTokenBudget).catch(() => ({
       content: '[workspace context unavailable]',
       approxTokens: 0,
       files: [] as string[],
+      source: 'fallback' as const,
     }))
-    this.events?.onContext?.({ files: contextDump.files, approxTokens: contextDump.approxTokens })
+    this.events?.onNotice?.({
+      level: 'info',
+      title: contextDump.source === 'graph' ? 'GraphRAG context ready' : 'Fallback context ready',
+      message:
+        contextDump.source === 'graph'
+          ? `${contextDump.files.length} files selected from SQLite graph index (${contextDump.approxTokens} tokens).`
+          : `${contextDump.files.length} files selected from repo-map/lexical retrieval (${contextDump.approxTokens} tokens). Run /context index to enable GraphRAG.`,
+    })
+    this.events?.onContext?.({
+      files: contextDump.files,
+      approxTokens: contextDump.approxTokens,
+      budgetTokens: this.contextTokenBudget,
+    })
     const system: ChatMessage = {
       role: 'system',
       content: [
-        buildSystemPrompt(this.tools),
+        buildSystemPrompt(this.tools, { permissionMode: this.permissionMode }),
         renderInstructionContext(instructionEntries),
+        extensionInstructions,
         renderMemoryPrompt(relevantMemories),
         `# Workspace Context\n${contextDump.content}`,
       ].join('\n\n'),
@@ -272,7 +313,19 @@ export class AgentSession {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const parsed = parseToolCalls(current)
       if (!parsed.ok) {
-        if (attempt === 1) return { assistant: current, calls: [], repaired, error: `Tool-call parse failed: ${parsed.error}` }
+        this.events?.onNotice?.({
+          level: parsed.kind === 'incomplete' ? 'warn' : 'error',
+          title: parsed.kind === 'incomplete' ? 'Repairing incomplete tool call' : 'Repairing malformed tool call',
+          message: parsed.error,
+        })
+        if (attempt === 1) {
+          this.events?.onNotice?.({
+            level: 'error',
+            title: 'Tool-call parse failed',
+            message: parsed.error,
+          })
+          return { assistant: current, calls: [], repaired, error: `Tool-call parse failed: ${parsed.error}` }
+        }
         current = (await this.repairToolCall(current, parsed.error)) ?? current
         repaired = true
         continue
@@ -281,7 +334,17 @@ export class AgentSession {
 
       const validated = validateToolCalls(parsed.calls, this.toolsByName)
       if (validated.ok) return { assistant: current, calls: validated.calls, repaired }
+      this.events?.onNotice?.({
+        level: 'warn',
+        title: 'Repairing invalid tool call',
+        message: validated.error,
+      })
       if (attempt === 1) {
+        this.events?.onNotice?.({
+          level: 'error',
+          title: 'Tool-call validation failed',
+          message: validated.error,
+        })
         return { assistant: current, calls: [], repaired, error: `Tool-call validation failed: ${validated.error}` }
       }
       current = (await this.repairToolCall(current, validated.error)) ?? current
@@ -305,6 +368,19 @@ export class AgentSession {
       { ...profile.defaults, format: 'json' },
     )
     return stripThinkBlocks(response.content)
+  }
+
+  private async writeMetadata(lastUserPrompt: string, compactSummary: string): Promise<void> {
+    const metadata: SessionMetadata = {
+      id: this.sessionId,
+      title: titleFromPrompt(lastUserPrompt),
+      cwd: this.workspaceRoot,
+      startedAt: this.startedAt,
+      updatedAt: new Date().toISOString(),
+      lastUserPrompt,
+      compactSummary,
+    }
+    await writeSessionMetadata(this.workspaceRoot, metadata).catch(() => {})
   }
 }
 
@@ -366,6 +442,11 @@ function previewChange(toolName: string, input: unknown): string {
 
 function truncate(text: string, max = 200): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+function titleFromPrompt(prompt: string): string {
+  const first = prompt.trim().split('\n')[0] ?? 'Untitled session'
+  return truncate(first, 80) || 'Untitled session'
 }
 
 async function executeToolSafely(

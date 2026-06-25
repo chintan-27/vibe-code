@@ -1,6 +1,8 @@
-import { Box, render, Static, Text, useApp, useInput, useStdout, type Key } from 'ink'
+import { Box, render, Text, useApp, useInput, useStdout, type Key } from 'ink'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AgentSession } from '@/loop/session.ts'
+import { initializeProject } from '@/cli/init.ts'
+import { buildGraphIndex, graphIndexStatus } from '@/context/graph/index.ts'
 import type {
   EffortMode,
   ContextInfo,
@@ -8,6 +10,7 @@ import type {
   PermissionMode,
   PermissionRequest,
   PlannedAction,
+  RuntimeNotice,
   SessionEvents,
 } from '@/loop/types.ts'
 import { copyFileSync, existsSync, mkdirSync } from 'fs'
@@ -20,6 +23,17 @@ import { stripThinkBlocks } from '@/toolcall/parse.ts'
 import { coreTools } from '@/tools/registry.ts'
 import type { AnyTool } from '@/tools/types.ts'
 import type { HooksConfig } from '@/hooks/hooks.ts'
+import { listCheckpoints, listSessionMetadata, restoreCheckpoint } from '@/loop/workflow.ts'
+import {
+  extensionInfo,
+  extensionSummary,
+  installExtension,
+  listExtensions,
+  removeExtension,
+  setExtensionEnabled,
+  trustExtension,
+} from '@/plugins/manager.ts'
+import type { PluginSettings } from '@/plugins/manager.ts'
 
 export type TuiOptions = {
   workspaceRoot: string
@@ -28,6 +42,7 @@ export type TuiOptions = {
   allow?: string[]
   hooks?: HooksConfig
   extraTools?: AnyTool[]
+  extensionSettings?: PluginSettings
 }
 
 type PendingPermission = { request: PermissionRequest; resolve: (d: PermissionDecision) => void }
@@ -42,6 +57,7 @@ type Block =
   | { kind: 'reasoning'; id: number; text: string }
   | { kind: 'tool'; id: number; tool: ToolEntry }
   | { kind: 'note'; id: number; text: string }
+  | { kind: 'notice'; id: number; notice: RuntimeNotice }
   | { kind: 'plan'; id: number; actions: PlannedAction[] }
 
 type Live = {
@@ -49,34 +65,54 @@ type Live = {
   assistant: string
   think: string
   tools: ToolEntry[]
+  notices: RuntimeNotice[]
+}
+
+type SlashCommand = {
+  name: string
+  hint: string
+  args?: string
 }
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 const PASTE_GAP_MS = 45 // a return arriving this soon after a keystroke is a pasted newline, not submit
 function freshLive(): Live {
-  return { active: false, assistant: '', think: '', tools: [] }
+  return { active: false, assistant: '', think: '', tools: [], notices: [] }
 }
 
 const IMG_RE = /(?:'[^'\n]+\.(?:png|jpe?g|gif|webp|bmp)'|"[^"\n]+\.(?:png|jpe?g|gif|webp|bmp)"|(?:[^\s'"]|\\ )+\.(?:png|jpe?g|gif|webp|bmp))/gi
 
 /**
- * When an image path is dragged/pasted in, copy it to a stable location *immediately* —
- * macOS deletes screenshot temp files (NSIRD_screencaptureui) within seconds, so by the
- * time the turn runs the original is gone. Replaces the path with the durable copy.
+ * Process a pasted chunk for display: keep the real content but show a compact
+ * placeholder. Image/file paths are copied to a durable temp (macOS deletes
+ * screenshot temps fast) and shown as "[Pasted File: name]"; text blocks over a
+ * handful of lines collapse to "[Pasted N lines]". The store maps each placeholder
+ * back to its real content for submission.
  */
-function capturePastedImages(text: string): string {
-  return text.replace(IMG_RE, match => {
+export function collapsePaste(value: string, store: Map<string, string>): string {
+  let foundFile = false
+  const withFiles = value.replace(IMG_RE, match => {
     const clean = match.replace(/^['"]|['"]$/g, '').replace(/\\ /g, ' ')
     try {
       if (!existsSync(clean)) return match
       const dest = join(tmpdir(), 'vibe-attachments', `${Date.now()}-${basename(clean)}`)
       mkdirSync(dirname(dest), { recursive: true })
       copyFileSync(clean, dest)
-      return dest
+      const label = `[Pasted File: ${basename(clean)}]`
+      store.set(label, dest)
+      foundFile = true
+      return label
     } catch {
       return match
     }
   })
+  const lines = value.split('\n').length
+  if (!foundFile && lines > 6) {
+    const label = `[Pasted ${lines} lines]`
+    store.set(label, value)
+    return label
+  }
+  return withFiles
 }
 
 // --- design system: one palette + glyph set used across every component ---
@@ -92,15 +128,35 @@ const C = {
 } as const
 
 const G = {
-  user: '❯',
+  user: '›',
   assistant: '●',
   tool: '⏺',
   result: '⎿',
-  reasoning: '✶',
+  reasoning: '✸',
   plan: '◇',
-  note: '·',
+  note: '◆',
   bullet: '▸',
+  spark: '✦',
 }
+
+const COMMANDS: SlashCommand[] = [
+  { name: '/help', hint: 'show command help' },
+  { name: '/init', hint: 'generate VIBE.md' },
+  { name: '/context', hint: 'toggle context panel', args: '[query]' },
+  { name: '/diff', hint: 'show git summary' },
+  { name: '/rewind', hint: 'list checkpoints', args: '[id]' },
+  { name: '/sessions', hint: 'list saved sessions' },
+  { name: '/resume', hint: 'planned resume entry', args: '<id>' },
+  { name: '/commit', hint: 'commit current changes' },
+  { name: '/review', hint: 'review working tree' },
+  { name: '/plan', hint: 'toggle read-only planning' },
+  { name: '/plugins', hint: 'manage skills/plugins', args: 'list|add|info|trust|enable|disable|remove|update' },
+  { name: '/perm', hint: 'set permission mode', args: 'default|acceptEdits|plan|auto' },
+  { name: '/effort', hint: 'set effort', args: 'low|medium|high|xhigh' },
+  { name: '/image', hint: 'read image path', args: '<path> [question]' },
+  { name: '/clear', hint: 'clear transcript' },
+  { name: '/exit', hint: 'quit' },
+]
 
 export function startTui(options: TuiOptions): Promise<void> {
   const instance = render(<App options={options} />)
@@ -110,7 +166,8 @@ export function startTui(options: TuiOptions): Promise<void> {
 export function App({ options }: { options: TuiOptions }) {
   const { exit } = useApp()
   const { stdout } = useStdout()
-  const width = Math.min(stdout?.columns ?? 80, 120)
+  const width = stdout?.columns ?? 100
+  const height = stdout?.rows ?? 24
 
   const client = useRef(new OllamaClient()).current
   const [effort, setEffort] = useState<EffortMode>(options.effort)
@@ -134,6 +191,7 @@ export function App({ options }: { options: TuiOptions }) {
   const [context, setContext] = useState<ContextInfo>({ files: [], approxTokens: 0 })
   const [tokensThisTurn, setTokensThisTurn] = useState(0)
   const [tokPerSec, setTokPerSec] = useState(0)
+  const [loadMs, setLoadMs] = useState(0)
   // Input editor state lives in refs (source of truth, burst-safe) mirrored to view state.
   const inputRef = useRef('')
   const cursorRef = useRef(0)
@@ -151,6 +209,7 @@ export function App({ options }: { options: TuiOptions }) {
   const [qTyping, setQTyping] = useState(false) // chose "type my own answer"
   const [frame, setFrame] = useState(0)
   const [trusted, setTrusted] = useState(() => isTrusted(options.workspaceRoot))
+  const [commandIndex, setCommandIndex] = useState(0)
   const idRef = useRef(0)
   const nextId = () => (idRef.current += 1)
 
@@ -186,6 +245,35 @@ export function App({ options }: { options: TuiOptions }) {
     cursorRef.current = Math.max(0, Math.min(inputRef.current.length, cursorRef.current + delta))
     setCursorView(cursorRef.current)
   }
+  const deleteWord = () => {
+    const i = cursorRef.current
+    if (i === 0) return
+    const before = inputRef.current.slice(0, i).replace(/[^\S\n]*[^\s]*$/, '') // trailing spaces + last word
+    inputRef.current = before + inputRef.current.slice(i)
+    cursorRef.current = before.length
+    syncInput()
+  }
+  const deleteToStart = () => {
+    inputRef.current = inputRef.current.slice(cursorRef.current)
+    cursorRef.current = 0
+    syncInput()
+  }
+  const insertNewline = () => insertText('\n')
+  const replaceTrailingBackslashWithNewline = (): boolean => {
+    const i = cursorRef.current
+    if (i === 0 || inputRef.current[i - 1] !== '\\') return false
+    inputRef.current = `${inputRef.current.slice(0, i - 1)}\n${inputRef.current.slice(i)}`
+    cursorRef.current = i
+    syncInput()
+    return true
+  }
+  // Paste store: maps a friendly placeholder (e.g. "[Pasted 23 lines]") to the real content.
+  const pasteStore = useRef(new Map<string, string>())
+  const expandPastes = (text: string): string => {
+    let out = text
+    for (const [label, content] of pasteStore.current) out = out.split(label).join(content)
+    return out
+  }
 
   // Build (or rebuild) the session whenever the mode changes.
   useEffect(() => {
@@ -214,6 +302,12 @@ export function App({ options }: { options: TuiOptions }) {
       },
       onUsage: usage => {
         if (usage.durationMs > 0) setTokPerSec(Math.round((usage.completionTokens / usage.durationMs) * 1000))
+        if (usage.loadDurationMs !== undefined) setLoadMs(usage.loadDurationMs)
+      },
+      onNotice: notice => {
+        liveRef.current.notices.push(notice)
+        setTranscript(prev => [...prev, { kind: 'notice', id: nextId(), notice }])
+        dirtyRef.current = true
       },
       onPermissionRequest: request =>
         new Promise<PermissionDecision>(resolve => setPendingPermission({ request, resolve })),
@@ -233,6 +327,7 @@ export function App({ options }: { options: TuiOptions }) {
       tools: options.extraTools && options.extraTools.length > 0 ? [...coreTools, ...options.extraTools] : undefined,
       allow: options.allow,
       hooks: options.hooks,
+      extensionSettings: options.extensionSettings,
       events,
     })
   }, [client, effort, permMode, options.workspaceRoot, options.extraTools, options.allow, options.hooks])
@@ -245,12 +340,22 @@ export function App({ options }: { options: TuiOptions }) {
       if (dirtyRef.current) {
         dirtyRef.current = false
         const current = liveRef.current
-        setLive({ active: true, assistant: current.assistant, think: current.think, tools: [...current.tools] })
+        setLive({
+          active: true,
+          assistant: current.assistant,
+          think: current.think,
+          tools: [...current.tools],
+          notices: [...current.notices],
+        })
         setTokensThisTurn(tokensRef.current)
       }
     }, 60)
     return () => clearInterval(timer)
   }, [live.active])
+
+  useEffect(() => {
+    setCommandIndex(0)
+  }, [inputView])
 
   const submit = useCallback(async (text: string) => {
     const session = sessionRef.current
@@ -258,13 +363,13 @@ export function App({ options }: { options: TuiOptions }) {
     setTranscript(prev => [...prev, { kind: 'user', id: nextId(), text }])
     setHistory(prev => [...prev, text])
     setHistoryIdx(-1)
-    liveRef.current = { active: true, assistant: '', think: '', tools: [] }
+    liveRef.current = { active: true, assistant: '', think: '', tools: [], notices: [] }
     tokensRef.current = 0
     dirtyRef.current = false
     turnStartRef.current = Date.now()
     const controller = new AbortController()
     abortRef.current = controller
-    setLive({ active: true, assistant: '', think: '', tools: [] })
+    setLive({ active: true, assistant: '', think: '', tools: [], notices: [] })
     setTokensThisTurn(0)
 
     let result
@@ -305,19 +410,27 @@ export function App({ options }: { options: TuiOptions }) {
   const editText = (value: string, key: Key, onSubmit: (text: string) => void) => {
     if (key.leftArrow) return moveCursor(-1)
     if (key.rightArrow) return moveCursor(1)
+    // Word delete: Option/Alt+Backspace, Ctrl+W, or raw ESC+DEL.
+    if ((key.meta && (key.backspace || key.delete)) || (key.ctrl && value === 'w') || value === '\x17' || value === '\x1b\x7f')
+      return deleteWord()
+    // Delete to line start: Cmd+Backspace (when it reaches us) or Ctrl+U.
+    if ((key.meta && key.ctrl) || (key.ctrl && value === 'u') || value === '\x15') return deleteToStart()
     // macOS Backspace arrives as key.delete (DEL 0x7f); treat both as delete-before-cursor.
     if (key.backspace || key.delete) return backspaceAt()
     if (key.return) {
+      if (key.shift) return insertNewline()
+      if (replaceTrailingBackslashWithNewline()) return
       if (Date.now() - lastEditAt.current < PASTE_GAP_MS) return insertText('\n')
-      const text = inputRef.current
+      const text = expandPastes(inputRef.current)
       setInputAll('')
+      pasteStore.current.clear()
       onSubmit(text)
       return
     }
     if (value && !key.ctrl && !key.meta) {
-      // On a paste containing an image path, durably copy it before macOS deletes the temp.
-      const text = value.length > 3 && /\.(png|jpe?g|gif|webp|bmp)/i.test(value) ? capturePastedImages(value) : value
-      insertText(text)
+      // A paste (multi-char): keep the real content but show a compact placeholder for
+      // files/images and big text blocks. Verbatim for short inline text.
+      insertText(value.length > 1 ? collapsePaste(value, pasteStore.current) : value)
     }
   }
 
@@ -326,9 +439,130 @@ export function App({ options }: { options: TuiOptions }) {
     if (!text) return
     if (text === '/exit' || text === '/quit') return exit()
     if (text === '/help') return setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: HELP }])
+    if (text === '/context index') {
+      setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: 'Building GraphRAG index…' }])
+      void buildGraphIndex(options.workspaceRoot, {
+        onProgress: progress => {
+          setTranscript(prev => [...prev, { kind: 'notice', id: nextId(), notice: { level: 'info', title: 'GraphRAG indexing', message: progress.message } }])
+        },
+      })
+        .then(index => {
+          const stats = index.stats
+          index.close()
+          setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `GraphRAG indexed ${stats.files} files, ${stats.symbols} symbols, ${stats.chunks} chunks, ${stats.edges} edges.` }])
+        })
+        .catch(error => {
+          setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `GraphRAG index failed: ${error instanceof Error ? error.message : String(error)}` }])
+        })
+      return
+    }
+    if (text === '/context status') {
+      void graphIndexStatus(options.workspaceRoot).then(status => {
+        setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: status }])
+      })
+      return
+    }
+    if (text.startsWith('/context')) {
+      setShowContext(s => !s)
+      return
+    }
     if (text === '/clear') return setTranscript([])
     if (text === '/commit') return void submit(COMMIT_PROMPT)
     if (text === '/review') return void submit(REVIEW_PROMPT)
+    if (text.startsWith('/plugins')) {
+      void runPluginCommand(options.workspaceRoot, text.slice('/plugins'.length).trim(), options.extensionSettings).then(message => {
+        setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: message }])
+      })
+      return
+    }
+    if (text === '/plan') {
+      const next = permMode === 'plan' ? 'default' : 'plan'
+      setPermMode(next)
+      setTranscript(prev => [
+        ...prev,
+        {
+          kind: 'note',
+          id: nextId(),
+          text:
+            next === 'plan'
+              ? 'Plan mode enabled. Mutating tools will be proposed, not executed.'
+              : 'Plan mode disabled. Permission mode restored to default.',
+        },
+      ])
+      return
+    }
+    if (text === '/init') {
+      setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: 'Analyzing repository and writing VIBE.md…' }])
+      void initializeProject(options.workspaceRoot, client)
+        .then(result => {
+          setTranscript(prev => [
+            ...prev,
+            { kind: 'note', id: nextId(), text: `Wrote ${result.path} and seeded a ${result.memoryName} memory.` },
+          ])
+        })
+        .catch(error => {
+          setTranscript(prev => [
+            ...prev,
+            { kind: 'note', id: nextId(), text: `init failed: ${error instanceof Error ? error.message : String(error)}` },
+          ])
+        })
+      return
+    }
+    if (text === '/diff') return setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: gitSummary(options.workspaceRoot) }])
+    if (text === '/rewind') {
+      void listCheckpoints(options.workspaceRoot).then(checkpoints => {
+        setTranscript(prev => [
+          ...prev,
+          {
+            kind: 'note',
+            id: nextId(),
+            text:
+              checkpoints.length === 0
+                ? 'No checkpoints yet.'
+                : `${checkpoints
+                    .slice(0, 8)
+                    .map(cp => `${cp.timestamp}  ${cp.tool}  ${cp.touchedFiles.join(', ')}`)
+                    .join('\n')}\nRestore is not available until checkpoint confirmation lands.`,
+          },
+        ])
+      })
+      return
+    }
+    if (text.startsWith('/rewind restore')) {
+      const [, , sessionId, turnText, confirm] = text.split(/\s+/)
+      if (!sessionId || !turnText || confirm !== '--confirm') {
+        setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: 'usage: /rewind restore <sessionId> <turn> --confirm' }])
+        return
+      }
+      void restoreCheckpoint(options.workspaceRoot, sessionId, Number.parseInt(turnText, 10))
+        .then(meta => {
+          setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `Restored checkpoint ${meta.sessionId}/${meta.turn}: ${meta.touchedFiles.join(', ')}` }])
+        })
+        .catch(error => {
+          setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `restore failed: ${error instanceof Error ? error.message : String(error)}` }])
+        })
+      return
+    }
+    if (text === '/sessions') {
+      void listSessionMetadata(options.workspaceRoot).then(sessions => {
+        setTranscript(prev => [
+          ...prev,
+          {
+            kind: 'note',
+            id: nextId(),
+            text: sessions.length === 0 ? 'No saved sessions yet.' : sessions.map(s => `${s.id}  ${s.updatedAt}  ${s.title}`).join('\n'),
+          },
+        ])
+      })
+      return
+    }
+    if (text.startsWith('/resume')) {
+      const id = text.split(/\s+/)[1]
+      return setTranscript(prev => [
+        ...prev,
+        { kind: 'note', id: nextId(), text: id ? `Resume ${id} is planned, but full resume is not available yet.` : 'usage: /resume <session-id>' },
+      ])
+    }
     if (text.startsWith('/image')) {
       const rest = text.slice('/image'.length).trim()
       const [path, ...q] = rest.split(' ')
@@ -441,15 +675,53 @@ export function App({ options }: { options: TuiOptions }) {
       }
       return
     }
+    const suggestions = commandSuggestions(inputRef.current)
+    if (suggestions.length > 0) {
+      if (key.upArrow) {
+        setCommandIndex(i => (i - 1 + suggestions.length) % suggestions.length)
+        return
+      }
+      if (key.downArrow) {
+        setCommandIndex(i => (i + 1) % suggestions.length)
+        return
+      }
+      if (key.tab) {
+        completeCommand(suggestions[Math.min(commandIndex, suggestions.length - 1)]?.name)
+        return
+      }
+      if (key.return && !isExactCommand(inputRef.current)) {
+        completeCommand(suggestions[Math.min(commandIndex, suggestions.length - 1)]?.name)
+        return
+      }
+    }
     editText(value, key, runInputLine)
   })
 
   const elapsedS = live.active ? Math.max(0, Math.round((Date.now() - turnStartRef.current) / 1000)) : 0
+  const wide = width >= 108
+  const mainWidth = width
+  const suggestions = live.active ? [] : commandSuggestions(inputView)
+  const selectedCommand = Math.min(commandIndex, Math.max(0, suggestions.length - 1))
+  const inputRows = Math.min(6, inputView.split('\n').length + 2)
+  const reservedRows =
+    inputRows + // input
+    1 + // status
+    (suggestions.length > 0 && !live.active ? Math.min(9, suggestions.length * 2 + 3) : 0) +
+    (pendingPermission ? 10 : 0) +
+    (pendingQuestion ? 8 : 0) +
+    (showContext ? 8 : 0)
+  const transcriptRows = Math.max(4, height - reservedRows)
+  const visibleTranscript = selectVisibleBlocks(transcript, transcriptRows)
+
+  const completeCommand = (command?: string) => {
+    if (!command) return
+    setInputAll(`${command} `)
+  }
 
   // Trust gate — shown until the workspace is approved.
   if (!trusted) {
     return (
-      <Box flexDirection="column" width={width}>
+      <Box flexDirection="column" width={width} height={height}>
         <BannerView model={profile.model} workspace={options.workspaceRoot} effort={effort} width={width} />
         <TrustGate workspace={options.workspaceRoot} width={width} />
       </Box>
@@ -457,45 +729,26 @@ export function App({ options }: { options: TuiOptions }) {
   }
 
   return (
-    <Box flexDirection="column" width={width}>
-      <Static items={transcript}>{block => <BlockView key={block.id} block={block} width={width} />}</Static>
-
-      {showContext && context.files.length > 0 && <ContextPanel context={context} width={width} />}
-
-      {live.active && (
-        <Box flexDirection="column">
-          {live.think.trim() !== '' &&
-            (showReasoning ? (
-              <ReasoningView text={live.think} live />
-            ) : (
-              <Box marginTop={1}>
-                <Text color={C.muted} dimColor>
-                  {`${G.reasoning} thinking… ${approxTokens(live.think)} tok · ${elapsedS}s · ^R to expand`}
-                </Text>
-              </Box>
-            ))}
-          {live.tools.map((tool, i) => (
-            <ToolView key={`live-tool-${i}`} tool={tool} />
+    <Box flexDirection="column" width={width} height={height}>
+      <Box flexDirection="column" width={width} flexGrow={1} flexShrink={1}>
+        <Box flexDirection="column" width={mainWidth} flexGrow={1} flexShrink={1}>
+          {visibleTranscript.map(block => (
+            <BlockView key={block.id} block={block} width={mainWidth} />
           ))}
-          {live.assistant.trim() !== '' && !looksLikeToolDraft(live.assistant) && (
-            <Box marginTop={1}>
-              <Text>
-                <Text color={C.brand} bold>
-                  {G.assistant}
-                </Text>
-                {` ${stripThinkBlocks(live.assistant)}`}
-              </Text>
-            </Box>
+
+          {!wide && showContext && context.files.length > 0 && <ContextPanel context={context} width={mainWidth} />}
+
+          {live.active && (
+            <LiveTurnView
+              live={live}
+              showReasoning={showReasoning}
+              elapsedS={elapsedS}
+              frame={frame}
+              width={mainWidth}
+            />
           )}
-          <Box marginTop={1}>
-            <Text color={C.brandBright}>{`${SPINNER[frame]} `}</Text>
-            <Text color={C.muted}>{`${spinnerLabel(live)}  ${elapsedS}s`}</Text>
-            <Text color={C.muted} dimColor>
-              {'   ·  esc to stop'}
-            </Text>
-          </Box>
         </Box>
-      )}
+      </Box>
 
       {pendingPermission && <PermissionPrompt request={pendingPermission.request} width={width} />}
       {pendingQuestion && (
@@ -508,27 +761,55 @@ export function App({ options }: { options: TuiOptions }) {
         />
       )}
 
-      <StatusBar
-        effort={effort}
-        permMode={permMode}
-        model={profile.model}
-        ctxTokens={context.approxTokens}
-        budget={budget}
-        tokPerSec={tokPerSec}
-        tokensThisTurn={tokensThisTurn}
-        active={live.active}
-        width={width}
-      />
+      {wide && showContext && (
+        <TopDashboard
+          context={context}
+          effort={effort}
+          permMode={permMode}
+          model={profile.model}
+          live={live}
+          tokPerSec={tokPerSec}
+          loadMs={loadMs}
+          width={width}
+        />
+      )}
+      {suggestions.length > 0 && !live.active && (
+        <CommandSuggestions commands={suggestions} selected={selectedCommand} width={width} />
+      )}
+      {wide ? (
+        <MissionBar
+          workspace={options.workspaceRoot}
+          effort={effort}
+          permMode={permMode}
+          context={context}
+          active={live.active}
+          tokPerSec={tokPerSec}
+          width={width}
+        />
+      ) : (
+        <StatusBar
+          effort={effort}
+          permMode={permMode}
+          model={profile.model}
+          ctxTokens={context.approxTokens}
+          budget={budget}
+          tokPerSec={tokPerSec}
+          loadMs={loadMs}
+          tokensThisTurn={tokensThisTurn}
+          active={live.active}
+          width={width}
+        />
+      )}
       <Box borderStyle="round" borderColor={live.active ? C.muted : C.accent} paddingX={1} width={width}>
         <Text color={live.active ? C.muted : C.accent} bold>
           {`${G.user} `}
         </Text>
         {live.active ? (
-          <Text color="gray">working… (^C to quit)</Text>
+          <Text color="gray">turn in progress · Esc stops · ^C quits</Text>
         ) : inputView === '' ? (
           <Text>
             <Text inverse> </Text>
-            <Text color="gray">{'  type or paste a request · Enter to send · /help'}</Text>
+            <Text color="gray">{'  Ask, paste, drag files, type /, or \\↵ newline'}</Text>
           </Text>
         ) : (
           <Text>
@@ -540,6 +821,259 @@ export function App({ options }: { options: TuiOptions }) {
       </Box>
     </Box>
   )
+}
+
+function MissionBar(props: {
+  workspace: string
+  effort: EffortMode
+  permMode: PermissionMode
+  context: ContextInfo
+  active: boolean
+  tokPerSec: number
+  width: number
+}) {
+  const cwd = basename(props.workspace)
+  const budget = props.context.budgetTokens ?? getModelProfile('coder').defaults.numCtx
+  const pct = Math.min(100, Math.round((props.context.approxTokens / budget) * 100))
+  const model = getModelProfile('coder').model.replace(':7b', '')
+  return (
+    <Box width={props.width} paddingX={1}>
+      <Box flexGrow={1}>
+        <Text bold>{model}</Text>
+        <Text color={C.muted}>+vibethinker · </Text>
+        <Text color={C.accent}>{cwd || 'workspace'}</Text>
+        <Text color={C.muted}> · </Text>
+        <Badge label={props.permMode} color={permissionColor(props.permMode)} inverse />
+        <Text color={C.muted}>{` · ${props.effort}`}</Text>
+      </Box>
+      <Text color={C.muted}>
+        {'ctx '}
+        <Text color={C.accent}>{`${pct}%`}</Text>
+        {` · ${formatTokens(props.context.approxTokens)}/${formatTokens(budget)} · ${props.tokPerSec} tok/s`}
+      </Text>
+    </Box>
+  )
+}
+
+function LiveTurnView({
+  live,
+  showReasoning,
+  elapsedS,
+  frame,
+  width,
+}: {
+  live: Live
+  showReasoning: boolean
+  elapsedS: number
+  frame: number
+  width: number
+}) {
+  return (
+    <Box flexDirection="column">
+      {live.think.trim() !== '' &&
+        (showReasoning ? (
+          <ReasoningView text={live.think} live />
+        ) : (
+          <Box marginTop={1}>
+            <Text color={C.muted} dimColor>
+              {`${G.reasoning} thinking… ${formatTokens(approxTokens(live.think))} · ${elapsedS}s · ^R to expand`}
+            </Text>
+          </Box>
+        ))}
+      {live.tools.map((tool, i) => (
+        <ToolView key={`live-tool-${i}`} tool={tool} width={width} />
+      ))}
+      {live.notices.slice(-2).map((notice, i) => (
+        <NoticeView key={`live-notice-${i}-${notice.title}`} notice={notice} />
+      ))}
+      {live.assistant.trim() !== '' && !looksLikeToolDraft(live.assistant) && (
+        <Box marginTop={1}>
+          <Text>
+            <Text color={C.brand} bold>
+              {G.assistant}
+            </Text>
+            {` ${stripThinkBlocks(live.assistant)}`}
+          </Text>
+        </Box>
+      )}
+      <Box marginTop={1}>
+        <Text color={C.brandBright}>{`${SPINNER[frame]} `}</Text>
+        <Text color={C.muted}>{`${spinnerLabel(live)}  ${elapsedS}s`}</Text>
+        <Text color={C.muted} dimColor>
+          {'   ·  Esc stop'}
+        </Text>
+      </Box>
+    </Box>
+  )
+}
+
+function TopDashboard(props: {
+  context: ContextInfo
+  effort: EffortMode
+  permMode: PermissionMode
+  model: string
+  live: Live
+  tokPerSec: number
+  loadMs: number
+  width: number
+}) {
+  const budget = props.context.budgetTokens ?? getModelProfile('coder').defaults.numCtx
+  const pct = Math.min(100, Math.round((props.context.approxTokens / budget) * 100))
+  const activeTool = props.live.tools.find(tool => tool.ok === undefined)
+  return (
+    <Box width={props.width} borderStyle="single" borderColor={C.muted} paddingX={1}>
+      <Box width={Math.floor(props.width * 0.34)} flexDirection="column">
+        <Text color={C.accent} bold>{`${G.spark} Context`}</Text>
+        <Text color={C.muted}>{`${meter(pct, 10)} ${formatTokens(props.context.approxTokens)}/${formatTokens(budget)}`}</Text>
+        <Text color={C.muted}>{`${props.context.files.length} files${props.context.files[0] ? ` · ${clip(props.context.files[0], 24)}` : ''}`}</Text>
+      </Box>
+      <Box width={Math.floor(props.width * 0.34)} flexDirection="column">
+        <Text color={C.accent} bold>Session</Text>
+        <Text>
+          <Badge label={props.effort.toUpperCase()} color={C.brand} />
+          <Text color={C.muted}> </Text>
+          <Badge label={props.permMode.toUpperCase()} color={permissionColor(props.permMode)} />
+        </Text>
+        <Text color={C.muted}>{`${clip(props.model, 24)} · ${props.tokPerSec} tok/s${props.loadMs ? ` · ${props.loadMs}ms` : ''}`}</Text>
+      </Box>
+      <Box flexDirection="column" flexGrow={1}>
+        <Text color={C.accent} bold>Activity</Text>
+        <Text color={activeTool ? C.warn : C.muted}>{activeTool ? `running ${toolTitle(activeTool.name)}` : 'idle'}</Text>
+        <Text color={C.muted}>{`${props.live.tools.length} tools · ${props.live.notices.length} notices · ^R reasoning · / commands`}</Text>
+      </Box>
+    </Box>
+  )
+}
+
+function CommandSuggestions({
+  commands,
+  selected,
+  width,
+}: {
+  commands: SlashCommand[]
+  selected: number
+  width: number
+}) {
+  const panelWidth = Math.min(Math.max(48, width - 8), 72)
+  const marginLeft = Math.max(0, Math.floor((width - panelWidth) / 2))
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="single"
+      borderColor={C.muted}
+      paddingX={1}
+      width={panelWidth}
+      marginLeft={marginLeft}
+      marginTop={1}
+    >
+      <Text color={C.muted} bold>Commands</Text>
+      {commands.slice(0, 6).map((command, i) => (
+        <Box key={command.name} flexDirection="column">
+          <Text color={i === selected ? C.accentBright : undefined} bold={i === selected}>
+            {i === selected ? '› ' : '  '}
+            {command.name}
+            {command.args ? ` ${command.args}` : ''}
+            <Text color={C.muted}>{`  ${command.hint}`}</Text>
+          </Text>
+          {i === selected && (
+            <Text color={C.muted}>{`  ${commandDescription(command.name)}`}</Text>
+          )}
+        </Box>
+      ))}
+      <Text color={C.muted} dimColor>{'  ↑/↓ select · Tab complete · Enter choose/run'}</Text>
+    </Box>
+  )
+}
+
+function commandDescription(name: string): string {
+  switch (name) {
+    case '/context':
+      return 'Toggle context panel, or run /context index and /context status.'
+    case '/diff':
+      return 'Show the current working-tree summary.'
+    case '/rewind':
+      return 'List checkpoints from previous mutating actions.'
+    case '/init':
+      return 'Analyze this repository and write a project-specific VIBE.md.'
+    case '/plan':
+      return 'Toggle read-only mode: propose writes/edits/commands without executing them.'
+    case '/plugins':
+      return 'Install and manage local skills, MCP plugins, JS plugins, and registry entries.'
+    case '/sessions':
+      return 'List saved local session metadata.'
+    default:
+      return 'Run command or insert it into the composer.'
+  }
+}
+
+async function runPluginCommand(workspaceRoot: string, input: string, settings?: PluginSettings): Promise<string> {
+  const [command = 'list', ...rest] = input.split(/\s+/).filter(Boolean)
+  const arg = rest.join(' ')
+  try {
+    if (command === 'list') return extensionSummary(workspaceRoot, settings)
+    if (command === 'add') {
+      if (!arg) return 'usage: /plugins add <path|git|registry-id>'
+      const extension = await installExtension(workspaceRoot, arg, settings)
+      return `Installed ${extension.id} (${extension.manifest.kind ?? 'skill'}).${extension.trusted === 'untrusted' ? ` Run /plugins trust ${extension.id} before executable features load.` : ''}`
+    }
+    if (command === 'info') {
+      if (!arg) return 'usage: /plugins info <id>'
+      return extensionInfo(workspaceRoot, arg, settings)
+    }
+    if (command === 'enable' || command === 'disable') {
+      if (!arg) return `usage: /plugins ${command} <id>`
+      const extension = await setExtensionEnabled(workspaceRoot, arg, command === 'enable')
+      return `${extension.id} ${extension.enabled ? 'enabled' : 'disabled'}.`
+    }
+    if (command === 'trust') {
+      if (!arg) return 'usage: /plugins trust <id>'
+      const extension = await trustExtension(workspaceRoot, arg)
+      return `${extension.id} trusted. Restart or reset the session for executable features to load.`
+    }
+    if (command === 'remove') {
+      if (!arg) return 'usage: /plugins remove <id>'
+      await removeExtension(workspaceRoot, arg)
+      return `${arg} removed.`
+    }
+    if (command === 'update') {
+      const id = arg.trim()
+      if (!id) {
+        const extensions = await listExtensions(workspaceRoot, settings)
+        if (extensions.length === 0) return 'No plugins installed.'
+        const updated = await Promise.all(extensions.map(extension => installExtension(workspaceRoot, extension.source.value, settings)))
+        return `Updated ${updated.map(extension => extension.id).join(', ')}.`
+      }
+      const extension = (await listExtensions(workspaceRoot, settings)).find(item => item.id === id)
+      if (!extension) return `plugin not found: ${id}`
+      const updated = await installExtension(workspaceRoot, extension.source.value, settings)
+      return `Updated ${updated.id}.`
+    }
+    return 'usage: /plugins list|add|info|enable|disable|trust|remove|update'
+  } catch (error) {
+    return `plugins ${command} failed: ${error instanceof Error ? error.message : String(error)}`
+  }
+}
+
+function selectVisibleBlocks(blocks: Block[], maxRows: number): Block[] {
+  let used = 0
+  const out: Block[] = []
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]
+    if (!block) continue
+    const rows = estimateBlockRows(block)
+    if (out.length > 0 && used + rows > maxRows) break
+    out.unshift(block)
+    used += rows
+  }
+  return out
+}
+
+function estimateBlockRows(block: Block): number {
+  if (block.kind === 'banner') return 12
+  if (block.kind === 'tool') return block.tool.name === 'Edit' ? 6 : 3
+  if (block.kind === 'plan') return block.actions.length + 3
+  if (block.kind === 'notice') return 3
+  return Math.min(8, Math.max(2, 'text' in block ? block.text.split('\n').length + 1 : 2))
 }
 
 function BlockView({ block, width }: { block: Block; width: number }) {
@@ -586,10 +1120,13 @@ function BlockView({ block, width }: { block: Block; width: number }) {
       </Box>
     )
   }
+  if (block.kind === 'notice') {
+    return <NoticeView notice={block.notice} />
+  }
   if (block.kind === 'plan') {
     return <PlanView actions={block.actions} width={width} />
   }
-  return <ToolView tool={block.tool} />
+  return <ToolView tool={block.tool} width={width} />
 }
 
 const LOGO = [
@@ -614,53 +1151,107 @@ function BannerView({
   effort: EffortMode
   width: number
 }) {
+  const reasoner = getModelProfile('reasoner')
+  const coder = getModelProfile('coder')
+  const showLogo = width >= 70
   return (
     <Box flexDirection="column" width={width} marginBottom={1}>
-      {LOGO.map((line, i) => (
-        <Text key={`logo-${i}`} color={LOGO_COLORS[i]} bold>
-          {line}
-          {i === 2 ? <Text color="gray">{'   a local coding agent · 100% local via ollama'}</Text> : null}
+      {showLogo ? (
+        <Box flexDirection="column">
+          {LOGO.map((line, i) => (
+            <Text key={`logo-${i}`} color={LOGO_COLORS[i] ?? C.accent} bold>
+              {line}
+            </Text>
+          ))}
+          <Text> </Text>
+        </Box>
+      ) : (
+        <Text>
+          <Text color={C.accent} bold>▌ vibe code</Text>
         </Text>
-      ))}
-      <Box marginTop={1} flexDirection="column">
-        <Text color={C.muted}>
-          <Text color={C.brand}>{`  ${G.bullet} `}</Text>
-          {`reason  VibeThinker-3B  ·  format ${model}`}
-          <Text color={C.muted}>{`   ·   effort ${effort}`}</Text>
-        </Text>
-        <Text color={C.muted}>
-          <Text color={C.brand}>{`  ${G.bullet} `}</Text>
-          {`cwd     ${workspace}`}
-        </Text>
-        <Text color={C.muted} dimColor>
-          {'      /help · ^R thinking · ^O context · ^C quit'}
-        </Text>
-      </Box>
+      )}
+      <Text>
+        <Text bold>Vibe Code</Text>
+        <Text color={C.muted}>{'  ·  local-first coding agent'}</Text>
+      </Text>
+      <Text color={C.muted}>
+        {'model   '}
+        <Text color={C.accent}>{model}</Text>
+        {' + '}
+        <Text color={C.brand}>vibethinker</Text>
+        {`   (ctx ${formatTokens(coder.defaults.numCtx)} / ${formatTokens(reasoner.defaults.numCtx)})`}
+      </Text>
+      <Text color={C.muted}>
+        {'cwd     '}
+        <Text>{workspace}</Text>
+      </Text>
+      <Text color={C.muted} dimColor>
+        {`hint    type a task, or /help for commands · ^C quit · effort ${effort}`}
+      </Text>
     </Box>
   )
 }
 
-function ToolView({ tool }: { tool: ToolEntry }) {
+function ToolView({ tool, width }: { tool: ToolEntry; width: number }) {
   const dotColor = tool.ok === undefined ? C.warn : tool.ok ? C.ok : C.err
   const isTodos = tool.name === 'TodoWrite' && tool.ok
+  const state = tool.ok === undefined ? 'running' : tool.ok ? 'done' : 'failed'
+  const maxArg = Math.max(24, Math.min(86, width - 28))
   return (
     <Box flexDirection="column" marginTop={1}>
       <Box>
         <Text color={dotColor}>{`${G.tool} `}</Text>
         <Text bold>{toolTitle(tool.name)}</Text>
-        <Text color={C.muted}>{prettyArgs(tool) ? `(${prettyArgs(tool)})` : ''}</Text>
+        {prettyArgs(tool) ? (
+          <Text color={C.muted}>{`(${clip(prettyArgs(tool), maxArg)})`}</Text>
+        ) : null}
+        <Text color={dotColor} dimColor={tool.ok !== undefined}>{` · ${state}`}</Text>
+      </Box>
+      <Box flexDirection="column" marginLeft={2}>
+        <ToolPreview tool={tool} />
       </Box>
       {tool.name === 'Edit' ? <EditDiff raw={tool.raw} /> : null}
       {isTodos ? (
-        <TodoView result={tool.result ?? ''} />
-      ) : tool.result && tool.ok !== undefined ? (
-        <Box>
-          <Text color={C.muted}>{`  ${G.result}  `}</Text>
-          <Text color={tool.ok ? C.muted : C.err} dimColor={tool.ok}>
-            {resultLine(tool)}
-          </Text>
+        <Box marginLeft={2}>
+          <TodoView result={tool.result ?? ''} />
         </Box>
+      ) : tool.result && tool.ok !== undefined ? (
+        <Text color={tool.ok ? C.muted : C.err} dimColor={tool.ok}>
+          {`  ${G.result} ${resultLine(tool)}`}
+        </Text>
       ) : null}
+    </Box>
+  )
+}
+
+function ToolPreview({ tool }: { tool: ToolEntry }) {
+  const raw = tool.raw && typeof tool.raw === 'object' ? (tool.raw as Record<string, unknown>) : {}
+  const s = (value: unknown): string => (typeof value === 'string' ? value : '')
+  if (tool.name === 'Write') {
+    const content = s(raw.content)
+    return (
+      <Box flexDirection="column" marginLeft={2}>
+        <Text color={C.muted}>{`${content.length} chars · ${Buffer.byteLength(content, 'utf8')} bytes`}</Text>
+        <Text color={C.accent}>{firstLines(content || '[empty file]', 8)}</Text>
+      </Box>
+    )
+  }
+  if (tool.name === 'Read') return null
+  if (tool.name === 'Bash') {
+    return <Text color={C.brandBright}>{`$ ${clip(s(raw.command), 90)}`}</Text>
+  }
+  if (tool.name === 'Edit') return null
+  return null
+}
+
+function NoticeView({ notice }: { notice: RuntimeNotice }) {
+  const color = notice.level === 'error' ? C.err : notice.level === 'warn' ? C.warn : C.accent
+  return (
+    <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor={color} paddingX={1}>
+      <Text color={color} bold>
+        {notice.title}
+      </Text>
+      <Text color={C.muted}>{clip(notice.message, 110)}</Text>
     </Box>
   )
 }
@@ -776,6 +1367,8 @@ function looksLikeToolDraft(text: string): boolean {
 }
 
 function spinnerLabel(live: Live): string {
+  const pending = live.tools.find(tool => tool.ok === undefined)
+  if (pending) return `running ${toolTitle(pending.name)}…`
   if (live.think && !live.assistant) return 'thinking…'
   if (looksLikeToolDraft(live.assistant)) return 'preparing action…'
   return 'working…'
@@ -789,8 +1382,8 @@ function EditDiff({ raw }: { raw: unknown }) {
   if (oldStr === undefined && newStr === undefined) return null
   return (
     <Box flexDirection="column" marginLeft={2}>
-      {oldStr !== undefined && <Text color={C.err}>{`- ${firstLines(oldStr, 3)}`}</Text>}
-      {newStr !== undefined && <Text color={C.ok}>{`+ ${firstLines(newStr, 3)}`}</Text>}
+      {oldStr !== undefined && <Text color={C.err}>{`- ${firstLines(oldStr, 6)}`}</Text>}
+      {newStr !== undefined && <Text color={C.ok}>{`+ ${firstLines(newStr, 6)}`}</Text>}
     </Box>
   )
 }
@@ -812,11 +1405,12 @@ function ReasoningView({ text, live }: { text: string; live?: boolean }) {
 }
 
 function ContextPanel({ context, width }: { context: ContextInfo; width: number }) {
-  const pct = Math.min(100, Math.round((context.approxTokens / 12_000) * 100))
+  const budget = context.budgetTokens ?? getModelProfile('coder').defaults.numCtx
+  const pct = Math.min(100, Math.round((context.approxTokens / budget) * 100))
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={C.accent} paddingX={1} width={width} marginTop={1}>
       <Text color={C.accent} bold>
-        {`Context  ·  ${context.files.length} files  ·  ~${context.approxTokens} tok  ${meter(pct, 12)}`}
+        {`${G.spark} Context  ${meter(pct, 12)}  ${formatTokens(context.approxTokens)} / ${formatTokens(budget)}  ·  ${context.files.length} files`}
       </Text>
       {context.files.slice(0, 10).map(file => (
         <Text key={file} color={C.muted}>
@@ -834,6 +1428,7 @@ function StatusBar(props: {
   ctxTokens: number
   budget: number
   tokPerSec: number
+  loadMs: number
   tokensThisTurn: number
   active: boolean
   width: number
@@ -841,24 +1436,53 @@ function StatusBar(props: {
   const pct = Math.min(100, Math.round((props.ctxTokens / props.budget) * 100))
   const permColor = props.permMode === 'auto' ? C.err : props.permMode === 'plan' ? C.accent : C.ok
   return (
-    <Box marginTop={1} width={props.width}>
-      <Text color={props.active ? C.brandBright : C.brand}>{`${G.tool} `}</Text>
-      <Text color={C.brand} bold>
-        VibeThinker
-      </Text>
-      <Text color={C.muted}>{`  ·  ${props.effort}  ·  `}</Text>
-      <Text color={permColor}>{props.permMode}</Text>
+    <Box marginTop={1} width={props.width} paddingX={1}>
+      <Text bold>{clip(props.model.replace(':7b', ''), 16)}</Text>
+      <Text color={C.muted}>+vibethinker · </Text>
+      <Text color={C.accent}>agent</Text>
+      <Text color={C.muted}> · </Text>
+      <Badge label={props.permMode} color={permColor} inverse />
+      <Text color={C.muted}> · ctx </Text>
+      <Text color={C.accent}>{`${pct}%`}</Text>
       <Text color={C.muted}>
-        {`  ·  ctx ${meter(pct, 10)} ${pct}%  ·  ${props.tokPerSec} tok/s${props.active ? `  ·  +${props.tokensThisTurn}` : ''}`}
+        {` · ${props.tokPerSec} tok/s${props.loadMs ? ` · ${props.loadMs}ms` : ''}${props.active ? ` · +${formatTokens(props.tokensThisTurn)}` : ''}`}
       </Text>
     </Box>
   )
 }
 
-/** Compact unicode progress meter, e.g. ▰▰▰▱▱▱. */
+function Badge({ label, color, inverse = false }: { label: string; color: string; inverse?: boolean }) {
+  return (
+    <Text color={color} bold inverse={inverse}>
+      {inverse ? ` ${label} ` : `[${label}]`}
+    </Text>
+  )
+}
+
+function permissionColor(mode: PermissionMode): string {
+  if (mode === 'auto') return C.err
+  if (mode === 'plan') return C.accent
+  if (mode === 'acceptEdits') return C.warn
+  return C.ok
+}
+
+function commandSuggestions(input: string): SlashCommand[] {
+  const trimmed = input.trimStart()
+  if (!trimmed.startsWith('/')) return []
+  if (/\s/.test(trimmed)) return []
+  const matches = COMMANDS.filter(command => command.name.startsWith(trimmed))
+  return matches.length > 0 ? matches : COMMANDS.filter(command => command.name.includes(trimmed))
+}
+
+function isExactCommand(input: string): boolean {
+  const trimmed = input.trim()
+  return COMMANDS.some(command => command.name === trimmed)
+}
+
+/** Compact unicode progress meter, e.g. ███░░░. */
 function meter(pct: number, width: number): string {
   const filled = Math.round((Math.min(100, Math.max(0, pct)) / 100) * width)
-  return '▰'.repeat(filled) + '▱'.repeat(Math.max(0, width - filled))
+  return '█'.repeat(filled) + '░'.repeat(Math.max(0, width - filled))
 }
 
 function TrustGate({ workspace, width }: { workspace: string; width: number }) {
@@ -887,33 +1511,64 @@ function TrustGate({ workspace, width }: { workspace: string; width: number }) {
 }
 
 function PermissionPrompt({ request, width }: { request: PermissionRequest; width: number }) {
+  const preview = formatPermissionPreview(request)
+  const summary = formatPermissionSummary(request)
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={C.warn} paddingX={1} width={width} marginTop={1}>
       <Text color={C.warn} bold>
-        {`Approve  ${toolTitle(request.tool)}?`}
+        {'Approve'}
+        <Text color={C.muted}>{'  ·  '}</Text>
+        <Text>{summary}</Text>
       </Text>
-      <Text color={C.muted}>
-        {request.preview
-          .split('\n')
-          .map(l => `  ${l}`)
-          .join('\n')}
-      </Text>
+      <Box flexDirection="column" marginTop={1}>{preview}</Box>
       <Box marginTop={1}>
-        <Text color={C.ok} bold>
-          {' [y] '}
-        </Text>
+        <KeyChip label="y" color={C.ok} />
         <Text color={C.muted}>allow once </Text>
-        <Text color={C.accent} bold>
-          {' [a] '}
-        </Text>
+        <KeyChip label="a" color={C.accent} />
         <Text color={C.muted}>always </Text>
-        <Text color={C.err} bold>
-          {' [n] '}
-        </Text>
+        <KeyChip label="n" color={C.err} />
         <Text color={C.muted}>deny</Text>
       </Box>
     </Box>
   )
+}
+
+function formatPermissionSummary(request: PermissionRequest): string {
+  const raw = request.input && typeof request.input === 'object' ? (request.input as Record<string, unknown>) : {}
+  const path = typeof raw.file_path === 'string' ? raw.file_path : ''
+  const command = typeof raw.command === 'string' ? raw.command : ''
+  if (path) return `${toolTitle(request.tool)}(${path})`
+  if (command) return `${toolTitle(request.tool)}(${clip(command, 52)})`
+  return toolTitle(request.tool)
+}
+
+function formatPermissionPreview(request: PermissionRequest): React.ReactNode[] {
+  const raw = request.input && typeof request.input === 'object' ? (request.input as Record<string, unknown>) : {}
+  const s = (value: unknown): string => (typeof value === 'string' ? value : '')
+  if (request.tool === 'Edit') {
+    return [
+      <Text key="path" color={C.muted}>{`  file  ${s(raw.file_path)}`}</Text>,
+      <Text key="old" color={C.err}>{`  - ${firstLines(s(raw.old_string), 4)}`}</Text>,
+      <Text key="new" color={C.ok}>{`  + ${firstLines(s(raw.new_string), 4)}`}</Text>,
+    ]
+  }
+  if (request.tool === 'Write') {
+    const content = s(raw.content)
+    return [
+      <Text key="path" color={C.muted}>{`  file  ${s(raw.file_path)}`}</Text>,
+      <Text key="count" color={C.muted}>{`  ${content.length} chars · ${Buffer.byteLength(content, 'utf8')} bytes`}</Text>,
+      <Text key="body" color={C.muted}>{`  ${firstLines(content || '[empty file]', 6)}`}</Text>,
+    ]
+  }
+  if (request.tool === 'Bash') {
+    return [
+      <Text key="cmd" color={C.muted}>{`  $ ${s(raw.command)}`}</Text>,
+      <Text key="hint" color={C.warn}>{'  Review command side effects before allowing.'}</Text>,
+    ]
+  }
+  return request.preview.split('\n').map((line, i) => (
+    <Text key={`preview-${i}`} color={C.muted}>{`  ${line}`}</Text>
+  ))
 }
 
 export function QuestionPrompt({
@@ -933,14 +1588,8 @@ export function QuestionPrompt({
   const hasOptions = opts.length > 0
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={C.accent} paddingX={1} width={width} marginTop={1}>
-      <Box>
-        <Text color={C.accent} bold>
-          {'? '}
-        </Text>
-        <Text color={C.accent} bold>
-          {question}
-        </Text>
-      </Box>
+      <Text color={C.accent} bold>Question</Text>
+      <Text>{question}</Text>
       {hasOptions && !typing ? (
         <Box flexDirection="column" marginTop={1}>
           {opts.map((opt, i) => (
@@ -969,6 +1618,14 @@ function Option({ label, active }: { label: string; active: boolean }) {
   )
 }
 
+function KeyChip({ label, color }: { label: string; color: string }) {
+  return (
+    <Text color={color} inverse bold>
+      {` ${label} `}
+    </Text>
+  )
+}
+
 function PlanView({ actions, width }: { actions: PlannedAction[]; width: number }) {
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={C.accent} paddingX={1} width={width} marginTop={1}>
@@ -985,13 +1642,14 @@ function PlanView({ actions, width }: { actions: PlannedAction[]; width: number 
         </Text>
       ))}
       <Text color={C.muted} dimColor>
-        {'  approve with /perm acceptEdits or /perm auto'}
+        {'  approve by switching out of /plan, or use /perm acceptEdits|auto'}
       </Text>
     </Box>
   )
 }
 
-const HELP = `Commands:  /help  /effort low|medium|high|xhigh  /perm default|acceptEdits|plan|auto  /image <path>  /commit  /review  /clear  /exit
+const HELP = `Commands:  /help  /init  /plan  /context index|status  /effort low|medium|high|xhigh  /perm default|acceptEdits|plan|auto  /image <path>  /diff  /rewind  /sessions  /commit  /review  /clear  /exit
+Modes:     /plan proposes changes without running them. default asks before edits, acceptEdits auto-applies file edits, auto runs unattended.
 Approvals:  [y] allow once  [a] always  [n] deny   ·   Keys: ^R thinking  ^O context  ↑/↓ history  ^C quit`
 
 const COMMIT_PROMPT =
@@ -1002,6 +1660,16 @@ const REVIEW_PROMPT =
 
 function approxTokens(text: string): number {
   return Math.max(1, Math.round(text.length / 4))
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${trimFixed(tokens / 1_000_000)}m`
+  if (tokens >= 1_000) return `${trimFixed(tokens / 1_000)}k`
+  return String(tokens)
+}
+
+function trimFixed(value: number): string {
+  return value >= 10 ? String(Math.round(value)) : value.toFixed(1).replace(/\.0$/, '')
 }
 
 function summarizeArgs(input: unknown): string {
@@ -1035,4 +1703,12 @@ function safeStringify(value: unknown): string {
 
 function asMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function gitSummary(cwd: string): string {
+  const status = Bun.spawnSync(['git', 'status', '--short'], { cwd })
+  const stat = Bun.spawnSync(['git', 'diff', '--stat'], { cwd })
+  const statusText = status.stdout.toString().trim() || '[working tree clean]'
+  const statText = stat.stdout.toString().trim()
+  return [`# git status --short`, statusText, '', '# git diff --stat', statText || '[no unstaged diff]'].join('\n')
 }

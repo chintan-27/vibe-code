@@ -1,5 +1,11 @@
 import type { ChatOptions } from './types.ts'
 
+const LARGE_TEXT_CONTEXT = readPositiveIntEnv('VIBE_NUM_CTX', 131_072)
+const CODER_CONTEXT = readPositiveIntEnv('VIBE_CODER_NUM_CTX', LARGE_TEXT_CONTEXT)
+const EXTRACTOR_CONTEXT = readPositiveIntEnv('VIBE_EXTRACTOR_NUM_CTX', LARGE_TEXT_CONTEXT)
+const REASONER_CONTEXT = readPositiveIntEnv('VIBE_REASONER_NUM_CTX', LARGE_TEXT_CONTEXT)
+const VISION_CONTEXT = readPositiveIntEnv('VIBE_VISION_NUM_CTX', 8_192)
+
 export type ModelRole = 'coder' | 'reasoner' | 'extractor' | 'vision'
 
 export type ModelProfile = {
@@ -19,7 +25,7 @@ export const modelProfiles = {
       // Large enough to write a full file in one Write call without truncation.
       maxTokens: 8192,
       // Wide window so the curated context can hold several files at once.
-      numCtx: 32768,
+      numCtx: CODER_CONTEXT,
     },
   },
   extractor: {
@@ -28,8 +34,10 @@ export const modelProfiles = {
     description: 'Low-temperature extraction and repair model.',
     defaults: {
       temperature: 0,
-      maxTokens: 768,
-      numCtx: 8192,
+      // Tool-call JSON can contain full-file Write payloads, so extraction needs
+      // the same completion room as the direct coder path.
+      maxTokens: 8192,
+      numCtx: EXTRACTOR_CONTEXT,
     },
   },
   reasoner: {
@@ -39,7 +47,7 @@ export const modelProfiles = {
     defaults: {
       temperature: 0.6,
       maxTokens: 2048,
-      numCtx: 32768,
+      numCtx: REASONER_CONTEXT,
     },
   },
   vision: {
@@ -49,7 +57,7 @@ export const modelProfiles = {
     defaults: {
       temperature: 0.2,
       maxTokens: 1024,
-      numCtx: 8192,
+      numCtx: VISION_CONTEXT,
     },
   },
 } satisfies Record<ModelRole, ModelProfile>
@@ -58,3 +66,9 @@ export function getModelProfile(role: ModelRole): ModelProfile {
   return modelProfiles[role]
 }
 
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (!raw) return fallback
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}

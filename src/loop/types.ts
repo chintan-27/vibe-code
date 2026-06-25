@@ -1,5 +1,6 @@
 import type { AnyTool } from '@/tools/types.ts'
 import type { HooksConfig } from '@/hooks/hooks.ts'
+import type { PluginSettings } from '@/plugins/manager.ts'
 
 export type { ChatClient } from '@/provider/types.ts'
 import type { ChatClient } from '@/provider/types.ts'
@@ -13,8 +14,19 @@ import type { ChatClient } from '@/provider/types.ts'
  */
 export type EffortMode = 'low' | 'medium' | 'high' | 'xhigh'
 
-export type ContextInfo = { files: string[]; approxTokens: number }
-export type TurnUsage = { completionTokens: number; durationMs: number }
+export type ContextInfo = { files: string[]; approxTokens: number; budgetTokens?: number }
+export type TurnUsage = {
+  completionTokens: number
+  durationMs: number
+  doneReason?: string
+  loadDurationMs?: number
+}
+
+export type RuntimeNotice = {
+  level: 'info' | 'warn' | 'error'
+  title: string
+  message: string
+}
 
 /**
  * Permission posture for a session (mirrors Claude Code):
@@ -46,6 +58,7 @@ export type SessionEvents = {
   onToolResult?: (name: string, ok: boolean, content: string) => void
   onContext?: (info: ContextInfo) => void
   onUsage?: (usage: TurnUsage) => void
+  onNotice?: (notice: RuntimeNotice) => void
   /** Ask the user to approve a mutating tool call. Absent ⇒ non-interactive. */
   onPermissionRequest?: (request: PermissionRequest) => Promise<PermissionDecision>
   /** Ask the user a free-form clarifying question (the AskUser tool). */
@@ -65,6 +78,7 @@ export type AgentLoopOptions = {
   permissionMode?: PermissionMode
   allow?: string[]
   hooks?: HooksConfig
+  extensionSettings?: PluginSettings
   events?: SessionEvents
 }
 

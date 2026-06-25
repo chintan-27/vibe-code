@@ -12,6 +12,7 @@ export type ToolCallParseResult =
     }
   | {
       ok: false
+      kind: 'malformed' | 'incomplete' | 'not_tool_call'
       error: string
       contentWithoutThink: string
     }
@@ -113,6 +114,7 @@ export function parseToolCalls(content: string): ToolCallParseResult {
     if (looksLikeToolCallAttempt(jsonText)) {
       return {
         ok: false,
+        kind: isIncompleteJson(jsonText) ? 'incomplete' : 'malformed',
         error: error instanceof Error ? error.message : String(error),
         contentWithoutThink,
       }
@@ -150,6 +152,20 @@ function parseXmlToolCalls(content: string): ParsedToolCall[] {
 /** Heuristic: the text was meant to be a tool call (has name + an args container). */
 function looksLikeToolCallAttempt(text: string): boolean {
   return /"name"\s*:/.test(text) && /"(arguments|input|parameters)"\s*:/.test(text)
+}
+
+export function isIncompleteToolJson(content: string): boolean {
+  const contentWithoutThink = stripThinkBlocks(content)
+  const jsonText = extractJsonCandidate(contentWithoutThink)
+  return Boolean(jsonText && looksLikeToolCallAttempt(jsonText) && isIncompleteJson(jsonText))
+}
+
+function isIncompleteJson(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed) return false
+  const start = findFirstJsonStart(trimmed)
+  if (start === -1) return false
+  return findMatchingJsonEnd(trimmed, start) === -1
 }
 
 function normalizeJsonToolCalls(parsed: unknown, raw: string): ParsedToolCall[] {

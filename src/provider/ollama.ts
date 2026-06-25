@@ -22,8 +22,10 @@ type OllamaChatResponse = {
     content?: string
   }
   total_duration?: number
+  load_duration?: number
   prompt_eval_count?: number
   eval_count?: number
+  done_reason?: string
   error?: string
 }
 
@@ -104,6 +106,17 @@ export class OllamaClient {
         last = part
       }
     }
+    const tail = buffer.trim()
+    if (tail) {
+      const part = JSON.parse(tail) as OllamaChatResponse
+      if (part.error) throw new Error(`ollama chat failed: ${part.error}`)
+      const delta = part.message?.content ?? ''
+      if (delta) {
+        content += delta
+        onToken(delta)
+      }
+      last = part
+    }
 
     return { content, model: last.model ?? model, usage: toUsage(last, startedAt) }
   }
@@ -151,10 +164,14 @@ function toUsage(response: OllamaChatResponse, startedAt: number): ChatUsage {
   return {
     promptTokens: response.prompt_eval_count ?? 0,
     completionTokens: response.eval_count ?? 0,
+    doneReason: response.done_reason,
+    loadDurationMs:
+      typeof response.load_duration === 'number'
+        ? Math.round(response.load_duration / 1_000_000)
+        : undefined,
     durationMs:
       typeof response.total_duration === 'number'
         ? Math.round(response.total_duration / 1_000_000)
         : Math.round(performance.now() - startedAt),
   }
 }
-

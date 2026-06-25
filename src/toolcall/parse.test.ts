@@ -58,6 +58,15 @@ describe('parseToolCalls', () => {
   test('still flags a genuinely malformed tool call for repair', () => {
     const result = parseToolCalls('{"name":"Read","arguments":{"file_path":"a.ts"')
     expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected parse failure')
+    expect(result.kind).toBe('incomplete')
+  })
+
+  test('classifies malformed complete tool JSON separately from incomplete JSON', () => {
+    const result = parseToolCalls('{"name":"Read","arguments":oops}')
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected parse failure')
+    expect(result.kind).toBe('malformed')
   })
 
   test('treats top-level fields beside name as arguments', () => {

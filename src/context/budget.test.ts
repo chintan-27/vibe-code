@@ -18,6 +18,6 @@ describe('dumpContext', () => {
     expect(result.content).toContain('src/alpha.ts')
     expect(result.content).toContain('makeAlpha')
     expect(result.approxTokens).toBeGreaterThan(0)
+    expect(result.source).toBe('fallback')
   })
 })
-

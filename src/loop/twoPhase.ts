@@ -1,7 +1,7 @@
 import { getModelProfile } from '@/provider/models.ts'
-import type { ChatMessage } from '@/provider/types.ts'
-import { createThinkSplitter, stripThinkBlocks } from '@/toolcall/parse.ts'
-import type { ChatClient, EffortMode, TurnUsage } from './types.ts'
+import type { ChatMessage, ChatOptions } from '@/provider/types.ts'
+import { createThinkSplitter, isIncompleteToolJson, stripThinkBlocks } from '@/toolcall/parse.ts'
+import type { ChatClient, EffortMode, RuntimeNotice, TurnUsage } from './types.ts'
 
 const RECENT_TAIL = 6
 
@@ -13,6 +13,7 @@ export type TwoPhaseOptions = {
   onThink?: (text: string) => void
   onToken?: (text: string) => void
   onUsage?: (usage: TurnUsage) => void
+  onNotice?: (notice: RuntimeNotice) => void
   signal?: AbortSignal
 }
 
@@ -61,23 +62,26 @@ export async function runTwoPhaseStep(
       : ''
 
   // Phase 3 — qwen extracts the structured action (streamed to the answer area).
-  const extracted = await streamVisible(
+  const extractionMessages: ChatMessage[] = [
+    {
+      role: 'system',
+      content: `${systemPrompt}\n\n---\nYou are the extraction step. Convert the reasoning below into the next action using the tools and exact argument names defined above. Use the required JSON schema. Output no hidden reasoning.`,
+    },
+    {
+      role: 'user',
+      content: `${recent}\n\nReasoning to act on:\n${conclusion}${review ? `\n\nReviewer notes to address:\n${review}` : ''}`,
+    },
+  ]
+  const extracted = (await constrainedExtract(client, extractor.model, extractionMessages, { ...extractor.defaults, signal: opts.signal }, opts))
+    ?? (await streamVisible(
     client,
     extractor.model,
-    [
-      {
-        role: 'system',
-        content: `${systemPrompt}\n\n---\nYou are the extraction step. Convert the reasoning below into the next action using the tools and exact argument names defined above. Emit exactly one tool-call JSON object, or a concise final answer if no tool is needed. Output no hidden reasoning.`,
-      },
-      {
-        role: 'user',
-        content: `${recent}\n\nReasoning to act on:\n${conclusion}${review ? `\n\nReviewer notes to address:\n${review}` : ''}`,
-      },
-    ],
+    extractionMessages,
     { ...extractor.defaults, signal: opts.signal },
     opts.onToken,
     opts.onUsage,
-  )
+    opts.onNotice,
+  ))
 
   return stripThinkBlocks(extracted)
 }
@@ -90,7 +94,98 @@ function directExtract(
   opts: TwoPhaseOptions,
 ): Promise<string> {
   const options = { ...getModelProfile('extractor').defaults, signal: opts.signal }
-  return streamVisible(client, model, messages, options, opts.onToken, opts.onUsage).then(stripThinkBlocks)
+  return constrainedExtract(client, model, messages, options, opts)
+    .then(result => result ?? streamVisible(client, model, messages, options, opts.onToken, opts.onUsage, opts.onNotice))
+    .then(stripThinkBlocks)
+}
+
+async function constrainedExtract(
+  client: ChatClient,
+  model: string,
+  messages: ChatMessage[],
+  options: ChatOptions,
+  opts: Pick<TwoPhaseOptions, 'onUsage' | 'onNotice'>,
+): Promise<string | undefined> {
+  try {
+    let result = await client.chat(
+      model,
+      [
+        ...messages,
+        {
+          role: 'user',
+          content:
+            'Return the next assistant output using the schema. Use kind="tool" with name and arguments for a tool call, or kind="final" with content when no tool is needed.',
+        },
+      ],
+      {
+        ...options,
+        temperature: 0,
+        format: ACTION_SCHEMA,
+      },
+    )
+    if (result.usage.doneReason === 'length' || isIncompleteToolJson(result.content)) {
+      opts.onNotice?.({
+        level: 'warn',
+        title: 'Retrying truncated action',
+        message: 'The constrained response ended before a complete action was available.',
+      })
+      result = await client.chat(
+        model,
+        [
+          ...messages,
+          {
+            role: 'user',
+            content:
+              'Your previous constrained response was truncated. Return the complete action using the schema only.',
+          },
+        ],
+        {
+          ...options,
+          temperature: 0,
+          maxTokens: Math.max((options.maxTokens ?? 0) * 2, 16_384),
+          format: ACTION_SCHEMA,
+        },
+      )
+    }
+    opts.onUsage?.(result.usage)
+    const decoded = JSON.parse(stripThinkBlocks(result.content)) as {
+      kind?: string
+      name?: unknown
+      arguments?: unknown
+      content?: unknown
+    }
+    if (decoded.kind === 'final' && typeof decoded.content === 'string') return decoded.content
+    if (decoded.kind === 'tool' && typeof decoded.name === 'string' && decoded.arguments && typeof decoded.arguments === 'object') {
+      return JSON.stringify({ name: decoded.name, arguments: decoded.arguments })
+    }
+    if (typeof decoded.name === 'string' && decoded.arguments && typeof decoded.arguments === 'object') {
+      return JSON.stringify({ name: decoded.name, arguments: decoded.arguments })
+    }
+    opts.onNotice?.({
+      level: 'warn',
+      title: 'Schema extraction fallback',
+      message: 'The constrained response did not contain a usable final answer or tool call.',
+    })
+    return undefined
+  } catch (error) {
+    opts.onNotice?.({
+      level: 'warn',
+      title: 'Schema extraction fallback',
+      message: error instanceof Error ? error.message : String(error),
+    })
+    return undefined
+  }
+}
+
+const ACTION_SCHEMA = {
+  type: 'object',
+  properties: {
+    kind: { type: 'string', enum: ['tool', 'final'] },
+    name: { type: 'string' },
+    arguments: { type: 'object' },
+    content: { type: 'string' },
+  },
+  required: ['kind'],
 }
 
 /** Quick qwen classification: does this request need step-by-step reasoning? */
@@ -170,7 +265,7 @@ async function streamRaw(
   client: ChatClient,
   model: string,
   messages: ChatMessage[],
-  options: Record<string, unknown>,
+  options: ChatOptions,
   onText?: (text: string) => void,
 ): Promise<string> {
   if (onText && client.chatStream) {
@@ -186,22 +281,69 @@ async function streamVisible(
   client: ChatClient,
   model: string,
   messages: ChatMessage[],
-  options: Record<string, unknown>,
+  options: ChatOptions,
   onToken?: (text: string) => void,
   onUsage?: (usage: TurnUsage) => void,
+  onNotice?: (notice: RuntimeNotice) => void,
 ): Promise<string> {
-  if (onToken && client.chatStream) {
-    const split = createThinkSplitter()
-    const result = await client.chatStream(model, messages, options, delta => {
-      const { visible } = split(delta)
-      if (visible) onToken(visible)
-    })
-    onUsage?.({ completionTokens: result.usage.completionTokens, durationMs: result.usage.durationMs })
-    return result.content
+  const run = async (runOptions: ChatOptions, streamTokens: boolean): Promise<{ content: string; usage: TurnUsage }> => {
+    if (streamTokens && onToken && client.chatStream) {
+      const split = createThinkSplitter()
+      const result = await client.chatStream(model, messages, runOptions, delta => {
+        const { visible } = split(delta)
+        if (visible) onToken(visible)
+      })
+      return { content: result.content, usage: result.usage }
+    }
+    const result = await client.chat(model, messages, runOptions)
+    return { content: result.content, usage: result.usage }
   }
-  const result = await client.chat(model, messages, options)
-  onUsage?.({ completionTokens: result.usage.completionTokens, durationMs: result.usage.durationMs })
-  return result.content
+
+  const first = await run(options, true)
+  onUsage?.(first.usage)
+  if (first.usage.doneReason !== 'length' && !isIncompleteToolJson(first.content)) {
+    return first.content
+  }
+
+  onNotice?.({
+    level: 'warn',
+    title: 'Retrying truncated action',
+    message: 'The model stopped before completing a tool call, so Vibe is retrying once with a larger output cap.',
+  })
+  const retryMessages: ChatMessage[] = [
+    ...messages,
+    {
+      role: 'user',
+      content:
+        'Your previous response was truncated or incomplete. Return the complete tool-call JSON only. Do not include prose or hidden reasoning.',
+    },
+  ]
+  const retryOptions: ChatOptions = {
+    ...options,
+    temperature: 0,
+    maxTokens: Math.max((options.maxTokens ?? 0) * 2, 16_384),
+  }
+  const second = await (async () => {
+    if (onToken && client.chatStream) {
+      const split = createThinkSplitter()
+      const result = await client.chatStream(model, retryMessages, retryOptions, delta => {
+        const { visible } = split(delta)
+        if (visible) onToken(visible)
+      })
+      return { content: result.content, usage: result.usage }
+    }
+    const result = await client.chat(model, retryMessages, retryOptions)
+    return { content: result.content, usage: result.usage }
+  })()
+  onUsage?.(second.usage)
+  if (second.usage.doneReason === 'length' || isIncompleteToolJson(second.content)) {
+    onNotice?.({
+      level: 'error',
+      title: 'Tool call still incomplete',
+      message: 'The retry also ended before a complete tool call was available.',
+    })
+  }
+  return second.content
 }
 
 function renderRecent(messages: ChatMessage[]): string {

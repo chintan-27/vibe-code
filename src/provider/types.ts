@@ -38,6 +38,10 @@ export interface ChatUsage {
   completionTokens: number
   /** Total wall-clock for the request, ms. */
   durationMs: number
+  /** Ollama final status, e.g. `stop` or `length`. */
+  doneReason?: string
+  /** Model load time for this request, ms, when reported by ollama. */
+  loadDurationMs?: number
 }
 
 export interface ChatResult {

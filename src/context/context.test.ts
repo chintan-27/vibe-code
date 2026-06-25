@@ -6,6 +6,7 @@ import { buildDependencyGraph, pageRank } from './depgraph.ts'
 import { extractSignatures, buildRepoMap } from './repomap.ts'
 import { retrieveSnippets } from './retrieve.ts'
 import { dumpContext } from './budget.ts'
+import { buildGraphIndex, graphIndexStatus, retrieveGraphContext } from './graph/index.ts'
 
 describe('extractSignatures', () => {
   test('keeps exported declarations with signatures and drops local variables', () => {
@@ -100,5 +101,35 @@ describe('dumpContext (multi-file)', () => {
     expect(result.files).toContain('src/server.ts')
     expect(result.files).not.toContain('src/styles.ts')
     expect(result.approxTokens).toBeLessThanOrEqual(12_000)
+  })
+})
+
+describe('GraphRAG index', () => {
+  test('indexes files, symbols, chunks, and graph neighbours for retrieval', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-graph-'))
+    await mkdir(join(ws, 'src'))
+    await writeFile(join(ws, 'src', 'parser.ts'), 'export function parseTokens(input: string) {\n  return input.split(" ")\n}\n', 'utf8')
+    await writeFile(join(ws, 'src', 'caller.ts'), "import { parseTokens } from './parser.ts'\nexport const run = () => parseTokens('a b')\n", 'utf8')
+
+    const index = await buildGraphIndex(ws)
+    expect(index.stats.files).toBe(2)
+    expect(index.stats.symbols).toBeGreaterThan(0)
+    expect(index.stats.chunks).toBeGreaterThan(0)
+    expect(index.stats.edges).toBeGreaterThan(0)
+    const fileCount = (index.db.query('select count(*) as count from files').get() as { count: number }).count
+    const symbolCount = (index.db.query('select count(*) as count from symbols').get() as { count: number }).count
+    const chunkCount = (index.db.query('select count(*) as count from chunks').get() as { count: number }).count
+    const edgeCount = (index.db.query('select count(*) as count from edges').get() as { count: number }).count
+    index.close()
+
+    expect(fileCount).toBe(2)
+    expect(symbolCount).toBeGreaterThan(0)
+    expect(chunkCount).toBeGreaterThan(0)
+    expect(edgeCount).toBeGreaterThan(0)
+
+    const result = await retrieveGraphContext(ws, 'parseTokens', { limit: 5 })
+    expect(result?.files[0]).toBe('src/parser.ts')
+    expect(result?.files).toContain('src/caller.ts')
+    expect(await graphIndexStatus(ws)).toContain('GraphRAG index: fresh')
   })
 })

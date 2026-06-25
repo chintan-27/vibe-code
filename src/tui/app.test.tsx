@@ -3,7 +3,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { render } from 'ink-testing-library'
-import { App, QuestionPrompt } from './app.tsx'
+import { App, QuestionPrompt, collapsePaste } from './app.tsx'
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -22,7 +22,14 @@ describe('TUI App', () => {
     expect(frame).toContain('qwen2.5-coder:7b')
     expect(frame).toContain('medium')
     expect(frame).toContain('quit')
-    expect(frame).toContain('❯')
+    expect(frame).toContain('›')
+    unmount()
+  })
+
+  test('keeps the idle frame within the terminal height', () => {
+    const { lastFrame, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
+    const rows = (lastFrame() ?? '').split('\n').length
+    expect(rows).toBeLessThanOrEqual(24)
     unmount()
   })
 
@@ -50,6 +57,21 @@ describe('TUI App', () => {
     }
   })
 
+  test('Ctrl+W deletes the previous word; Ctrl+U deletes to line start', async () => {
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
+    await delay(50)
+    stdin.write('foo bar')
+    await delay(30)
+    stdin.write('\x17') // Ctrl+W
+    await delay(40)
+    expect(lastFrame() ?? '').toContain('foo')
+    expect(lastFrame() ?? '').not.toContain('bar')
+    stdin.write('\x15') // Ctrl+U
+    await delay(40)
+    expect(lastFrame() ?? '').not.toContain('foo')
+    unmount()
+  })
+
   test('rapid pasted newlines stay in the buffer instead of submitting', async () => {
     const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
     await delay(50)
@@ -63,6 +85,22 @@ describe('TUI App', () => {
     unmount()
   })
 
+  test('backslash then Enter inserts a manual newline', async () => {
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
+    await delay(50)
+    stdin.write('first line\\')
+    await delay(80)
+    stdin.write('\r')
+    await delay(40)
+    stdin.write('second line')
+    await delay(50)
+    const frame = lastFrame() ?? ''
+    expect(frame).toContain('first line')
+    expect(frame).toContain('second line')
+    expect(frame).not.toContain('first line\\')
+    unmount()
+  })
+
   test('/help prints command help', async () => {
     const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
     await delay(50)
@@ -72,6 +110,56 @@ describe('TUI App', () => {
     await delay(50)
     expect(lastFrame() ?? '').toContain('Commands:')
     unmount()
+  })
+
+  test('slash input shows command suggestions', async () => {
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
+    await delay(50)
+    stdin.write('/')
+    await delay(50)
+    const frame = lastFrame() ?? ''
+    expect(frame).toContain('Commands')
+    expect(frame).toContain('/help')
+    expect(frame).toContain('/init')
+    unmount()
+  })
+
+  test('tab completes a slash command suggestion', async () => {
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'auto' }} />)
+    await delay(50)
+    stdin.write('/he')
+    await delay(40)
+    stdin.write('\t')
+    await delay(50)
+    expect(lastFrame() ?? '').toContain('/help')
+    unmount()
+  })
+
+  test('/plan toggles read-only planning mode', async () => {
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: tmpdir(), effort: 'medium', permissionMode: 'default' }} />)
+    await delay(50)
+    stdin.write('/plan')
+    await delay(80)
+    stdin.write('\r')
+    await delay(50)
+    const frame = lastFrame() ?? ''
+    expect(frame).toContain('Plan mode enabled')
+    expect(frame).toContain(' plan ')
+    unmount()
+  })
+})
+
+describe('collapsePaste', () => {
+  test('collapses a big text paste, preserving the real content', () => {
+    const store = new Map<string, string>()
+    const big = Array.from({ length: 12 }, (_, i) => `line ${i}`).join('\n')
+    const display = collapsePaste(big, store)
+    expect(display).toMatch(/\[Pasted \d+ lines\]/)
+    expect(store.get(display)).toBe(big)
+  })
+
+  test('leaves short inline text verbatim', () => {
+    expect(collapsePaste('a short line', new Map())).toBe('a short line')
   })
 })
 
@@ -111,7 +199,7 @@ describe('TUI trust gate', () => {
     await delay(60)
     const frame = lastFrame() ?? ''
     expect(frame).not.toContain('Do you trust')
-    expect(frame).toContain('❯') // main input is now shown
+    expect(frame).toContain('›') // main input is now shown
     unmount()
     delete process.env.VIBE_CONFIG_DIR
   })

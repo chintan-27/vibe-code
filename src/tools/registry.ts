@@ -1,4 +1,5 @@
 import { askUserTool } from './ask.ts'
+import { astEditTool } from './astedit.ts'
 import { bashTool } from './bash.ts'
 import { editTool } from './edit.ts'
 import { globTool } from './glob.ts'
@@ -21,6 +22,7 @@ export const coreTools = [
   todoWriteTool,
   taskTool,
   askUserTool,
+  astEditTool,
   webFetchTool,
   webSearchTool,
 ] satisfies AnyTool[]
@@ -28,4 +30,3 @@ export const coreTools = [
 export function toolMap(tools: AnyTool[] = coreTools): Map<string, AnyTool> {
   return new Map(tools.map(tool => [tool.name, tool]))
 }
-
