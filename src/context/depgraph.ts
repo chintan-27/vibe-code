@@ -2,14 +2,9 @@ import type { Dirent } from 'fs'
 import { readFile, readdir, stat } from 'fs/promises'
 import { extname, join, relative } from 'path'
 import { dirname, resolve as posixResolve } from 'path/posix'
+import { SKIP_DIRS } from '@/tools/walk.ts'
 
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'])
-// Hidden dirs (names starting with '.') are always skipped; these are extra non-hidden
-// directories that are huge or cloud-backed and would stall/swamp a scan (esp. from $HOME).
-const SKIP_DIRS = new Set([
-  'node_modules', 'claude-code', 'dist', 'build', 'vendor', 'target',
-  'Library', 'Applications', 'CloudStorage', 'OneDrive', 'Dropbox', '__pycache__',
-])
 const MAX_DEPTH = 12
 const MAX_FILES = 5_000
 const IMPORT_PATTERN =

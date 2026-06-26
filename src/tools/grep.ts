@@ -1,14 +1,8 @@
-import type { Dirent } from 'fs'
-import { readFile, readdir } from 'fs/promises'
-import { join } from 'path'
+import { readFile } from 'fs/promises'
 import { z } from 'zod'
 import { resolveWorkspacePath, toWorkspaceRelative } from './path.ts'
 import type { ToolDef } from './types.ts'
-
-const SKIP_DIRS = new Set([
-  'node_modules', 'claude-code', 'dist', 'build', 'vendor', 'target',
-  'Library', 'Applications', 'CloudStorage', 'OneDrive', 'Dropbox', '__pycache__',
-])
+import { walkFiles } from './walk.ts'
 
 export const grepTool = {
   name: 'Grep',
@@ -23,7 +17,7 @@ export const grepTool = {
     const base = resolveWorkspacePath(context.workspaceRoot, input.path ?? '.')
     const regex = new RegExp(input.pattern)
     const matches: string[] = []
-    await walk(base, async file => {
+    await walkFiles(base, async file => {
       const text = await readFile(file, 'utf8').catch(() => undefined)
       if (text === undefined) return matches.length < (input.limit ?? 100)
       const lines = text.split(/\r?\n/)
@@ -39,24 +33,4 @@ export const grepTool = {
     return { ok: true, content: matches.join('\n') || '[no matches]' }
   },
 } satisfies ToolDef
-
-async function walk(dir: string, visit: (file: string) => Promise<boolean>): Promise<boolean> {
-  let entries: Dirent[]
-  try {
-    entries = await readdir(dir, { withFileTypes: true })
-  } catch {
-    return true // unreadable directory (permissions / cloud timeout) — skip, keep going
-  }
-  for (const entry of entries) {
-    if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue
-    if (entry.isDirectory() && SKIP_DIRS.has(entry.name)) continue
-    const fullPath = join(dir, entry.name)
-    if (entry.isDirectory()) {
-      if (!(await walk(fullPath, visit))) return false
-    } else if (entry.isFile()) {
-      if (!(await visit(fullPath))) return false
-    }
-  }
-  return true
-}
 

@@ -286,20 +286,20 @@ async function streamVisible(
   onUsage?: (usage: TurnUsage) => void,
   onNotice?: (notice: RuntimeNotice) => void,
 ): Promise<string> {
-  const run = async (runOptions: ChatOptions, streamTokens: boolean): Promise<{ content: string; usage: TurnUsage }> => {
-    if (streamTokens && onToken && client.chatStream) {
+  const run = async (msgs: ChatMessage[], runOptions: ChatOptions): Promise<{ content: string; usage: TurnUsage }> => {
+    if (onToken && client.chatStream) {
       const split = createThinkSplitter()
-      const result = await client.chatStream(model, messages, runOptions, delta => {
+      const result = await client.chatStream(model, msgs, runOptions, delta => {
         const { visible } = split(delta)
         if (visible) onToken(visible)
       })
       return { content: result.content, usage: result.usage }
     }
-    const result = await client.chat(model, messages, runOptions)
+    const result = await client.chat(model, msgs, runOptions)
     return { content: result.content, usage: result.usage }
   }
 
-  const first = await run(options, true)
+  const first = await run(messages, options)
   onUsage?.(first.usage)
   if (first.usage.doneReason !== 'length' && !isIncompleteToolJson(first.content)) {
     return first.content
@@ -318,23 +318,11 @@ async function streamVisible(
         'Your previous response was truncated or incomplete. Return the complete tool-call JSON only. Do not include prose or hidden reasoning.',
     },
   ]
-  const retryOptions: ChatOptions = {
+  const second = await run(retryMessages, {
     ...options,
     temperature: 0,
     maxTokens: Math.max((options.maxTokens ?? 0) * 2, 16_384),
-  }
-  const second = await (async () => {
-    if (onToken && client.chatStream) {
-      const split = createThinkSplitter()
-      const result = await client.chatStream(model, retryMessages, retryOptions, delta => {
-        const { visible } = split(delta)
-        if (visible) onToken(visible)
-      })
-      return { content: result.content, usage: result.usage }
-    }
-    const result = await client.chat(model, retryMessages, retryOptions)
-    return { content: result.content, usage: result.usage }
-  })()
+  })
   onUsage?.(second.usage)
   if (second.usage.doneReason === 'length' || isIncompleteToolJson(second.content)) {
     onNotice?.({
