@@ -742,14 +742,18 @@ export function App({ options }: { options: TuiOptions }) {
       setShowContext(s => !s)
       return
     }
-    if (key.pageUp) {
+    // Ctrl+Y / Ctrl+E scroll the transcript (Page Up/Down are intercepted by the terminal).
+    if (key.ctrl && value === 'y') {
       setScrollOffset(s => s + 5)
       return
     }
-    if (key.pageDown) {
+    if (key.ctrl && (value === 'e' || value === '\x05')) {
       setScrollOffset(s => Math.max(0, s - 5))
       return
     }
+    // Keep pageUp/pageDown as secondary bindings (work in some terminal emulators).
+    if (key.pageUp) { setScrollOffset(s => s + 5); return }
+    if (key.pageDown) { setScrollOffset(s => Math.max(0, s - 5)); return }
     // Esc interrupts the running turn (model + tools abort, back to the prompt).
     if (live.active && key.escape) {
       abortRef.current?.abort()
@@ -805,9 +809,16 @@ export function App({ options }: { options: TuiOptions }) {
   const suggestions = live.active ? [] : commandSuggestions(inputView)
   const selectedCommand = Math.min(commandIndex, Math.max(0, suggestions.length - 1))
   const inputRows = Math.min(6, inputView.split('\n').length + 2)
+  const liveRows = live.active
+    ? 4 + // rounded border (2) + spinner + phase dots
+      Math.min(8, live.tools.length * 2) + // tool entries
+      (live.notices.length > 0 ? 3 : 0) + // notice box
+      (live.assistant.trim() ? Math.min(10, Math.ceil(live.assistant.length / 80) + 2) : 0) // streaming text
+    : 0
   const reservedRows =
     inputRows + // input
     1 + // status
+    liveRows + // live turn view when active
     (suggestions.length > 0 && !live.active ? Math.min(9, suggestions.length * 2 + 3) : 0) +
     (pendingPermission ? 10 : 0) +
     (pendingQuestion ? 8 : 0) +
@@ -838,7 +849,7 @@ export function App({ options }: { options: TuiOptions }) {
       <Box flexDirection="column" width={width} flexGrow={1} flexShrink={1}>
         <Box flexDirection="column" width={mainWidth} flexGrow={1} flexShrink={1}>
           {clampedScroll > 0 && (
-            <Text color={C.muted} dimColor>{`  ↑ scrolled back · PgDn↓ to return`}</Text>
+            <Text color={C.muted} dimColor>{`  ↑ scrolled back · ^E to return · ^Y/^E scroll`}</Text>
           )}
           {visibleTranscript.map(block => (
             <BlockView key={block.id} block={block} width={mainWidth} compactBanner={compactBanner} />
@@ -1266,7 +1277,7 @@ function estimateBlockRows(block: Block, compactBanner: boolean, width = 100): n
   if (block.kind === 'tool') return block.tool.name === 'Edit' ? 6 : 3
   if (block.kind === 'plan') return block.actions.length + 3
   if (block.kind === 'notice') return 3
-  if ('text' in block) return Math.min(16, Math.max(2, estimateWrappedRows(block.text, Math.max(20, width - 4)) + 1))
+  if ('text' in block) return Math.min(60, Math.max(2, estimateWrappedRows(block.text, Math.max(20, width - 4)) + 1))
   return 2
 }
 
@@ -1354,40 +1365,83 @@ function MarkdownView({ text, width, muted = false }: { text: string; width: num
   const nodes: React.ReactNode[] = []
   let inCode = false
   let paragraph: string[] = []
+  let tableRows: string[][] = []
+  let tableIsHeader = true
+
   const flushParagraph = () => {
     if (paragraph.length === 0) return
     nodes.push(...renderWrappedLine(paragraph.join(' '), width, muted ? C.muted : undefined, `p-${nodes.length}`))
     paragraph = []
   }
+  const flushTable = () => {
+    if (tableRows.length === 0) return
+    for (const [i, row] of tableRows.entries()) {
+      const isHeader = i === 0
+      const line = row.map(cell => cell.padEnd(20)).join('  │  ')
+      nodes.push(
+        <Text key={`tbl-${nodes.length}`} bold={isHeader} color={isHeader ? C.accentBright : muted ? C.muted : undefined}>
+          {wrapText(line, width)}
+        </Text>,
+      )
+      if (isHeader) nodes.push(<Text key={`tbl-sep-${nodes.length}`} color={C.muted} dimColor>{'─'.repeat(Math.min(width, 60))}</Text>)
+    }
+    tableRows = []
+    tableIsHeader = true
+  }
 
   for (const line of lines) {
     const trimmed = line.trim()
+
     if (trimmed.startsWith('```')) {
       flushParagraph()
+      flushTable()
       inCode = !inCode
       continue
     }
     if (inCode) {
-      nodes.push(
-        <Text key={`code-${nodes.length}`} color={C.accent}>
-          {`  ${wrapText(line, Math.max(10, width - 2))}`}
-        </Text>,
-      )
+      nodes.push(<Text key={`code-${nodes.length}`} color={C.accent}>{`  ${wrapText(line, Math.max(10, width - 2))}`}</Text>)
       continue
     }
+
+    // Table row: | cell | cell |
+    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+      flushParagraph()
+      const cells = trimmed.slice(1, -1).split('|').map(c => c.trim())
+      // Separator row (|---|---|) — marks end of header, skip rendering
+      if (cells.every(c => /^[-:]+$/.test(c))) { tableIsHeader = false; continue }
+      tableRows.push(cells)
+      continue
+    }
+    // Non-table line after table rows → flush table first
+    if (tableRows.length > 0) flushTable()
+
     if (!trimmed) {
       flushParagraph()
       nodes.push(<Text key={`blank-${nodes.length}`}> </Text>)
       continue
     }
+    // Horizontal rule
+    if (/^[-*_]{3,}$/.test(trimmed)) {
+      flushParagraph()
+      nodes.push(<Text key={`hr-${nodes.length}`} color={C.muted} dimColor>{'─'.repeat(Math.min(width, 60))}</Text>)
+      continue
+    }
     const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed)
     if (heading) {
       flushParagraph()
+      const level = (heading[1] ?? '#').length
       nodes.push(
-        <Text key={`heading-${nodes.length}`} color={C.accentBright} bold>
+        <Text key={`heading-${nodes.length}`} color={level === 1 ? C.brandBright : C.accentBright} bold>
           {wrapText(heading[2] ?? '', width)}
         </Text>,
       )
+      if (level <= 2) nodes.push(<Text key={`heading-ul-${nodes.length}`} color={C.muted} dimColor>{'─'.repeat(Math.min(width, 40))}</Text>)
+      continue
+    }
+    // Blockquote
+    if (trimmed.startsWith('> ')) {
+      flushParagraph()
+      nodes.push(<Text key={`bq-${nodes.length}`} color={C.muted}>{`▌ ${wrapText(trimmed.slice(2), Math.max(10, width - 2))}`}</Text>)
       continue
     }
     const list = /^(\d+[.)]|[-*])\s+(.+)$/.exec(trimmed)
@@ -1408,6 +1462,7 @@ function MarkdownView({ text, width, muted = false }: { text: string; width: num
     paragraph.push(trimmed)
   }
   flushParagraph()
+  flushTable()
   return <Box flexDirection="column">{nodes}</Box>
 }
 
@@ -1516,7 +1571,7 @@ function BannerView({
       <Text color={C.muted}>
         <Text color={C.muted} dimColor>{`${G.bullet} `}</Text>
         {clip(workspace, Math.max(24, panelWidth - 42))}
-        <Text color={C.muted} dimColor>{'  ·  /help  ·  ^C quit'}</Text>
+        <Text color={C.muted} dimColor>{'  ·  /help  ·  ^Y/^E scroll  ·  ^C quit'}</Text>
       </Text>
     </Box>
   )
