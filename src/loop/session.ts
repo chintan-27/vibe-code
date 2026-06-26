@@ -145,7 +145,7 @@ export class AgentSession {
         compactions += 1
       }
 
-      const content = await this.generate(signal)
+      const content = await this.generate(userInput, signal)
 
       const step = await this.resolveStep(stripThinkBlocks(content))
       this.messages.push({ role: 'assistant', content: step.assistant })
@@ -255,9 +255,10 @@ export class AgentSession {
    * qwen extracts the structured action (see runTwoPhaseStep). Effort controls
    * how much VibeThinker reasons and whether reviewers run.
    */
-  private async generate(signal?: AbortSignal): Promise<string> {
+  private async generate(userInput: string, signal?: AbortSignal): Promise<string> {
     return runTwoPhaseStep(this.client, this.messages, {
       effort: this.effort,
+      isResearch: shouldRequireDetailedAnswer(userInput),
       onThink: this.events?.onThink,
       onToken: this.events?.onToken,
       onUsage: this.events?.onUsage,
@@ -329,7 +330,9 @@ export class AgentSession {
       }
       parts.push(result.content)
     }
-    return parts.length ? parts.join('\n\n---\n\n') : undefined
+    if (!parts.length) return undefined
+    const combined = parts.join('\n\n---\n\n')
+    return isDeep ? deduplicateSearchResults(combined) : combined
   }
 
   /** Rebuild the system message with context/memory relevant to the latest request. */
@@ -557,18 +560,55 @@ function webSearchQuery(input: string): string {
     .slice(0, 300) || input.slice(0, 300)
 }
 
-/** For deep research queries, run two angles: the cleaned query + a technical/math variant. */
+/** For deep research queries, run two angles: the cleaned query + a technical/domain variant. */
 function buildSearchAngles(input: string): string[] {
   const base = webSearchQuery(input)
-  // Add a math/technical variant to get more quantitative sources.
+  const domain = researchDomain(input)
   const hasMath = /\b(math|equations?|derive|derivation|formula)\b/i.test(input)
   const hasSteps = /\b(step[- ]by[- ]step|stages?|process|how)\b/i.test(input)
-  const variant = hasMath
+  // First query: add domain hint (e.g. "research study") so academic sources rank higher.
+  const primary = domain ? `${base} ${domain}` : base
+  // Second query: technical/math angle for quantitative depth.
+  const secondary = hasMath
     ? `${base} mathematical derivation equations`
     : hasSteps
       ? `${base} methodology algorithm`
       : base
-  return variant === base ? [base] : [base, variant]
+  const angles = [primary]
+  if (secondary !== base && secondary !== primary) angles.push(secondary)
+  return angles
+}
+
+/** Detect domain to bias searches toward the right source type. */
+function researchDomain(input: string): string {
+  if (/\b(medical|clinical|brain|neural|surgical|DBS|tumor|cancer|diagnosis|treatment|pharmacol|anatomy|physiol|neuroscien)\b/i.test(input))
+    return 'research study'
+  if (/\b(physics|chemistry|quantum|molecular|thermodynamic|electromagnetic|optic|spectro)\b/i.test(input))
+    return 'scientific paper'
+  if (/\b(economics|finance|market|GDP|inflation|monetary|fiscal)\b/i.test(input))
+    return 'academic analysis'
+  return ''
+}
+
+/** Remove duplicate search entries (same URL) across multi-angle results. */
+function deduplicateSearchResults(raw: string): string {
+  const blocks = raw.split(/\n\n---\n\n/)
+  const seen = new Set<string>()
+  const deduped: string[] = []
+  for (const block of blocks) {
+    // Parse numbered entries: "N. Title\n   URL\n   Snippet"
+    const entries = block.split(/\n(?=\d+\. )/)
+    for (const entry of entries) {
+      const urlMatch = entry.match(/^\s+https?:\/\/\S+/m)
+      const key = urlMatch ? urlMatch[0].trim() : entry.slice(0, 80)
+      if (!seen.has(key)) {
+        seen.add(key)
+        // Trim overly long snippets to keep context tight.
+        deduped.push(entry.replace(/((?:\S+ ){60}\S+)\S*/g, '$1…'))
+      }
+    }
+  }
+  return deduped.join('\n\n')
 }
 
 function shouldRequireDetailedAnswer(input: string): boolean {

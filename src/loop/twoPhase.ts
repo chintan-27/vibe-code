@@ -7,9 +7,12 @@ const RECENT_TAIL = 6
 
 // How long VibeThinker reasons, by effort (low never reasons).
 const REASON_TOKENS: Record<EffortMode, number> = { low: 0, medium: 3072, high: 5120, xhigh: 8192 }
+// Research queries get more thinking budget at high/xhigh — they need depth, not speed.
+const RESEARCH_REASON_TOKENS: Record<EffortMode, number> = { low: 0, medium: 3072, high: 8192, xhigh: 16384 }
 
 export type TwoPhaseOptions = {
   effort: EffortMode
+  isResearch?: boolean
   onThink?: (text: string) => void
   onToken?: (text: string) => void
   onUsage?: (usage: TurnUsage) => void
@@ -43,13 +46,14 @@ export async function runTwoPhaseStep(
   const reasoner = getModelProfile('reasoner')
   const systemPrompt = messages[0]?.role === 'system' ? messages[0].content : ''
   const recent = renderRecent(messages.slice(1).slice(-RECENT_TAIL))
+  const tokenBudget = (opts.isResearch ? RESEARCH_REASON_TOKENS : REASON_TOKENS)[opts.effort]
 
   // Phase 1 — VibeThinker reasons. Whole output is reasoning → thinking panel.
   const reasoning = await streamRaw(
     client,
     reasoner.model,
     messages,
-    { ...reasoner.defaults, maxTokens: REASON_TOKENS[opts.effort], signal: opts.signal },
+    { ...reasoner.defaults, maxTokens: tokenBudget, signal: opts.signal },
     opts.onThink,
   )
   const conclusion = stripThinkBlocks(reasoning) || reasoning.trim()
