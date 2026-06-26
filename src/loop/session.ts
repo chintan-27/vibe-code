@@ -16,7 +16,7 @@ import { coreTools, toolMap } from '@/tools/registry.ts'
 import type { AnyTool, ToolContext } from '@/tools/types.ts'
 import { type HooksConfig, runHooks } from '@/hooks/hooks.ts'
 import { runTwoPhaseStep } from './twoPhase.ts'
-import { createSessionId, createToolCheckpoint, writeSessionMetadata, type SessionMetadata } from './workflow.ts'
+import { createSessionId, createToolCheckpoint, writeSessionState, type SessionState, type SessionMetadata } from './workflow.ts'
 import type {
   AgentLoopResult,
   ChatClient,
@@ -42,6 +42,7 @@ export type AgentSessionOptions = {
   /** Shell hooks run around tool execution (from settings.json). */
   hooks?: HooksConfig
   extensionSettings?: PluginSettings
+  resume?: SessionState
 }
 
 /**
@@ -63,8 +64,8 @@ export class AgentSession {
   private readonly permissionMode: PermissionMode
   private readonly hooks?: HooksConfig
   private readonly extensionSettings?: PluginSettings
-  private readonly sessionId = createSessionId()
-  private readonly startedAt = new Date().toISOString()
+  private sessionId: string
+  private startedAt: string
   /** Tools the user approved "always" for this session ("don't ask again"). */
   private readonly allowRules = new Set<string>()
   private messages: ChatMessage[] = []
@@ -82,6 +83,9 @@ export class AgentSession {
     this.permissionMode = options.permissionMode ?? 'auto'
     this.hooks = options.hooks
     this.extensionSettings = options.extensionSettings
+    this.sessionId = options.resume?.metadata.id ?? createSessionId()
+    this.startedAt = options.resume?.metadata.startedAt ?? new Date().toISOString()
+    this.messages = sanitizeRestoredMessages(options.resume?.messages ?? [])
     for (const tool of options.allow ?? []) this.allowRules.add(tool)
   }
 
@@ -90,13 +94,27 @@ export class AgentSession {
     this.messages = []
   }
 
+  restore(state: SessionState): void {
+    this.sessionId = state.metadata.id
+    this.startedAt = state.metadata.startedAt
+    this.messages = sanitizeRestoredMessages(state.messages)
+  }
+
   async run(userInput: string, signal?: AbortSignal): Promise<AgentLoopResult> {
     await this.writeMetadata(userInput, 'turn started')
-    await this.refreshSystemMessage(userInput)
-    const withImages = await this.attachImages(userInput)
-    this.messages.push({ role: 'user', content: withImages })
-
     const profile = getModelProfile('coder')
+    const historyBudget = Math.max(
+      1_500,
+      profile.defaults.numCtx - profile.defaults.maxTokens - this.contextTokenBudget - 1_024,
+    )
+    const preflightCompaction = await compactMessages(this.client, this.messages, { tokenThreshold: historyBudget, keepRecent: 6 })
+    if (preflightCompaction.compacted) this.messages = preflightCompaction.messages
+    await this.refreshSystemMessage(userInput)
+    const searchContext = await this.seedResearchContext(userInput, signal)
+    const withImages = await this.attachImages(userInput)
+    const userContent = searchContext ? `${withImages}\n\n[Web search results — use these as your primary source:]\n${searchContext}` : withImages
+    this.messages.push({ role: 'user', content: userContent })
+
     const context: ToolContext = {
       workspaceRoot: this.workspaceRoot,
       client: this.client,
@@ -107,9 +125,10 @@ export class AgentSession {
     let toolCalls = 0
     let validToolCalls = 0
     let repairedToolCalls = 0
-    let compactions = 0
+    let compactions = preflightCompaction.compacted ? 1 : 0
     let finalContent = ''
     let lastCallSignature = ''
+    let detailRetry = false
     const planned: PlannedAction[] = []
 
     const done = (finalContent: string, turn: number): AgentLoopResult => {
@@ -132,9 +151,26 @@ export class AgentSession {
       this.messages.push({ role: 'assistant', content: step.assistant })
       finalContent = step.assistant
       if (step.repaired) repairedToolCalls += 1
+      await this.writeMetadata(userInput, stripThinkBlocks(finalContent).slice(0, 500))
 
       if (step.error) return done(step.error, turn)
-      if (step.calls.length === 0) return done(finalContent, turn)
+      if (step.calls.length === 0) {
+        if (!detailRetry && shouldRequireDetailedAnswer(userInput) && isShallowDetailedAnswer(userInput, finalContent)) {
+          detailRetry = true
+          this.events?.onNotice?.({
+            level: 'warn',
+            title: 'Expanding shallow answer',
+            message: 'The answer was too brief for an in-depth/step-by-step request, so Vibe is retrying once with a stricter answer shape.',
+          })
+          this.messages.push({
+            role: 'user',
+            content:
+              `${INTERNAL_PROMPT_PREFIX} Your previous answer was too high-level for this request. Rewrite it as a substantive answer, not a summary. Required shape: (1) a brief scope/assumptions paragraph, (2) at least 8 numbered stages, (3) math/model section with equations and every variable defined when math is requested, (4) validation/error sources, (5) practical caveats, and (6) source/tool-result grounding or an explicit note that web search failed. Do not answer in one paragraph. Aim for at least 600 words when the user asks for in-depth stages.`,
+          })
+          continue
+        }
+        return done(finalContent, turn)
+      }
 
       const signature = step.calls.map(call => `${call.tool.name}:${JSON.stringify(call.input)}`).join('|')
       if (signature === lastCallSignature) {
@@ -267,26 +303,58 @@ export class AgentSession {
     return userInput + notes.join('')
   }
 
+  private async seedResearchContext(userInput: string, signal?: AbortSignal): Promise<string | undefined> {
+    if (!shouldSeedWebSearch(userInput)) return undefined
+    const tool = this.toolsByName.get('WebSearch')
+    if (!tool) return undefined
+
+    const isDeep = shouldRequireDetailedAnswer(userInput)
+    const queries = isDeep ? buildSearchAngles(userInput) : [webSearchQuery(userInput)]
+    const ctx: ToolContext = {
+      workspaceRoot: this.workspaceRoot,
+      client: this.client,
+      spawnDepth: this.spawnDepth,
+      askUser: this.events?.onAskUser,
+      signal,
+    }
+    const parts: string[] = []
+    for (const query of queries) {
+      const input = { query, maxResults: isDeep ? 8 : 6 }
+      this.events?.onTool?.(tool.name, input)
+      const result = await executeToolSafely(tool, input, ctx)
+      this.events?.onToolResult?.(tool.name, result.ok, result.content)
+      if (!result.ok) {
+        this.events?.onNotice?.({ level: 'error', title: 'WebSearch failed', message: result.content })
+        continue
+      }
+      parts.push(result.content)
+    }
+    return parts.length ? parts.join('\n\n---\n\n') : undefined
+  }
+
   /** Rebuild the system message with context/memory relevant to the latest request. */
   private async refreshSystemMessage(userInput: string): Promise<void> {
     const instructionEntries = await loadProjectInstructions(this.workspaceRoot).catch(() => [])
     const extensionInstructions = await renderExtensionInstructions(this.workspaceRoot, this.extensionSettings).catch(() => '')
     const relevantMemories = selectRelevantMemories(await loadMemories(this.workspaceRoot).catch(() => []), userInput)
+    const profile = getModelProfile('coder')
+    const basePrompt = buildSystemPrompt(this.tools, { permissionMode: this.permissionMode })
+    // Keep the whole system message inside the model window, including its completion reserve.
+    const availableTokens = profile.defaults.numCtx - profile.defaults.maxTokens - 1_024
+    const historyTokens = estimateTokens(userInput) + estimateTokens(this.messages.slice(1).map(message => message.content).join('\n'))
+    const promptBudget = Math.max(0, Math.min(this.contextTokenBudget, availableTokens - historyTokens))
+    const instructionContext = renderInstructionContext(instructionEntries, Math.floor(promptBudget * 0.2))
+    const memoryContext = clampPromptSection(renderMemoryPrompt(relevantMemories), Math.floor(promptBudget * 0.1), 'Memory')
+    const extensionContext = clampPromptSection(extensionInstructions, Math.floor(promptBudget * 0.1), 'Extension instructions')
+    const fixedTokens = estimateTokens([basePrompt, instructionContext, memoryContext, extensionContext].join('\n\n'))
+    const workspaceBudget = Math.max(0, promptBudget - fixedTokens)
     // Never let a slow/huge/unreadable tree (e.g. running from $HOME) crash the turn.
-    const contextDump = await dumpContext(this.workspaceRoot, userInput, this.contextTokenBudget).catch(() => ({
+    const contextDump = await dumpContext(this.workspaceRoot, userInput, workspaceBudget).catch(() => ({
       content: '[workspace context unavailable]',
       approxTokens: 0,
       files: [] as string[],
       source: 'fallback' as const,
     }))
-    this.events?.onNotice?.({
-      level: 'info',
-      title: contextDump.source === 'graph' ? 'GraphRAG context ready' : 'Fallback context ready',
-      message:
-        contextDump.source === 'graph'
-          ? `${contextDump.files.length} files selected from SQLite graph index (${contextDump.approxTokens} tokens).`
-          : `${contextDump.files.length} files selected from repo-map/lexical retrieval (${contextDump.approxTokens} tokens). Run /context index to enable GraphRAG.`,
-    })
     this.events?.onContext?.({
       files: contextDump.files,
       approxTokens: contextDump.approxTokens,
@@ -295,10 +363,10 @@ export class AgentSession {
     const system: ChatMessage = {
       role: 'system',
       content: [
-        buildSystemPrompt(this.tools, { permissionMode: this.permissionMode }),
-        renderInstructionContext(instructionEntries),
-        extensionInstructions,
-        renderMemoryPrompt(relevantMemories),
+        basePrompt,
+        instructionContext,
+        extensionContext,
+        memoryContext,
         `# Workspace Context\n${contextDump.content}`,
       ].join('\n\n'),
     }
@@ -380,7 +448,13 @@ export class AgentSession {
       lastUserPrompt,
       compactSummary,
     }
-    await writeSessionMetadata(this.workspaceRoot, metadata).catch(() => {})
+    await writeSessionState(this.workspaceRoot, {
+      metadata,
+      messages: this.messages
+        .filter(message => message.role !== 'system')
+        .filter(message => !isInternalPrompt(message))
+        .map(message => ({ ...message, content: stripThinkBlocks(message.content) })),
+    }).catch(() => {})
   }
 }
 
@@ -391,12 +465,24 @@ type StepResolution = {
   error?: string
 }
 
-function renderInstructionContext(entries: Awaited<ReturnType<typeof loadProjectInstructions>>): string {
+function renderInstructionContext(entries: Awaited<ReturnType<typeof loadProjectInstructions>>, tokenBudget: number): string {
   if (entries.length === 0) return '# Local Instructions\n[none]'
-  return ['# Local Instructions', ...entries.map(entry => `## ${entry.path}\n${entry.content.slice(0, 8000)}`)].join('\n\n')
+  const maxChars = Math.max(0, tokenBudget) * 4
+  if (maxChars < 80) return '# Local Instructions\n[omitted: no prompt budget remaining]'
+  const perEntryChars = Math.max(80, Math.floor((maxChars - 24) / entries.length))
+  const blocks = entries.map(entry => clampPromptSection(`## ${entry.path}\n${entry.content}`, Math.floor(perEntryChars / 4), 'Instruction file'))
+  return `# Local Instructions\n${blocks.join('\n\n')}`
+}
+
+function clampPromptSection(content: string, tokenBudget: number, label: string): string {
+  const maxChars = Math.max(1, tokenBudget) * 4
+  if (maxChars < 80) return `[${label} omitted: no prompt budget remaining.]`
+  if (content.length <= maxChars) return content
+  return `${content.slice(0, maxChars)}\n\n[${label} truncated to preserve model context.]`
 }
 
 const IMG_EXT = '(?:png|jpe?g|gif|webp|bmp)'
+const INTERNAL_PROMPT_PREFIX = '[internal instruction]'
 
 /**
  * Find image paths in a user message, tolerant of spaces. Handles quoted paths,
@@ -447,6 +533,57 @@ function truncate(text: string, max = 200): string {
 function titleFromPrompt(prompt: string): string {
   const first = prompt.trim().split('\n')[0] ?? 'Untitled session'
   return truncate(first, 80) || 'Untitled session'
+}
+
+function sanitizeRestoredMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages
+    .filter(message => message.role !== 'system' && typeof message.content === 'string' && !isInternalPrompt(message))
+    .map(message => ({ ...message, content: stripThinkBlocks(message.content) }))
+}
+
+function isInternalPrompt(message: ChatMessage): boolean {
+  return message.role === 'user' && message.content.trimStart().startsWith(INTERNAL_PROMPT_PREFIX)
+}
+
+function shouldSeedWebSearch(input: string): boolean {
+  return /\b(web\s*search|search the web|look\s+up|gather information|research|sources?|papers?|latest|current)\b/i.test(input)
+}
+
+function webSearchQuery(input: string): string {
+  return input
+    .replace(/\b(web\s*search|search the web|if needed|please|can you|could you)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300) || input.slice(0, 300)
+}
+
+/** For deep research queries, run two angles: the cleaned query + a technical/math variant. */
+function buildSearchAngles(input: string): string[] {
+  const base = webSearchQuery(input)
+  // Add a math/technical variant to get more quantitative sources.
+  const hasMath = /\b(math|equations?|derive|derivation|formula)\b/i.test(input)
+  const hasSteps = /\b(step[- ]by[- ]step|stages?|process|how)\b/i.test(input)
+  const variant = hasMath
+    ? `${base} mathematical derivation equations`
+    : hasSteps
+      ? `${base} methodology algorithm`
+      : base
+  return variant === base ? [base] : [base, variant]
+}
+
+function shouldRequireDetailedAnswer(input: string): boolean {
+  return /\b(in[- ]?depth|deep dive|step[- ]by[- ]step|stages?|method|math|equations?|derive|derivation|explain|how\b|tutorial|architecture|compare|comparison)\b/i.test(input)
+}
+
+function isShallowDetailedAnswer(input: string, answer: string): boolean {
+  const plain = stripThinkBlocks(answer).trim()
+  // Clarifying questions are valid short answers — don't retry them.
+  if (/\?\s*$/.test(plain) && plain.split(/\s+/).length < 200) return false
+  const words = plain.split(/\s+/).filter(Boolean).length
+  if (words < 500) return true
+  if (/\b(step[- ]by[- ]step|stages?|method)\b/i.test(input) && !/(^|\n)\s*(?:\d+\.|1\)|- )\s+\S/.test(plain)) return true
+  if (/\b(math|equations?|derive|derivation)\b/i.test(input) && !/[=∑∫∂√πσΩ]/.test(plain)) return true
+  return false
 }
 
 async function executeToolSafely(

@@ -12,6 +12,7 @@ export type Memory = {
 }
 
 const MEMORY_TYPES: ReadonlySet<string> = new Set(['user', 'feedback', 'project', 'reference'])
+const MAX_MEMORY_PROMPT_CHARS = 8_000
 
 /** Per-workspace memory directory: `<workspace>/.vibe/memory`. */
 export function memoryDir(workspaceRoot: string): string {
@@ -45,10 +46,12 @@ export function selectRelevantMemories(memories: Memory[], query: string, limit 
 
 export function renderMemoryPrompt(memories: Memory[]): string {
   if (memories.length === 0) return '# Memory\n[none]'
-  return [
+  const prompt = [
     '# Memory (durable notes about this project)',
     ...memories.map(memory => `## ${memory.name} [${memory.type}]\n${memory.description}\n${memory.body}`.trim()),
   ].join('\n\n')
+  if (prompt.length <= MAX_MEMORY_PROMPT_CHARS) return prompt
+  return `${prompt.slice(0, MAX_MEMORY_PROMPT_CHARS)}\n\n[Memory truncated to preserve model context.]`
 }
 
 export async function saveMemory(

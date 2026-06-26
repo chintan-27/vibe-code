@@ -2,6 +2,7 @@ import { mkdir, readFile, readdir, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import { resolveWorkspacePath } from '@/tools/path.ts'
+import type { ChatMessage } from '@/provider/types.ts'
 
 export type SessionMetadata = {
   id: string
@@ -11,6 +12,11 @@ export type SessionMetadata = {
   updatedAt: string
   lastUserPrompt: string
   compactSummary: string
+}
+
+export type SessionState = {
+  metadata: SessionMetadata
+  messages: ChatMessage[]
 }
 
 export type CheckpointMetadata = {
@@ -35,6 +41,25 @@ export async function writeSessionMetadata(
   await writeFile(join(dir, `${metadata.id}.json`), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8')
 }
 
+export async function writeSessionState(
+  workspaceRoot: string,
+  state: SessionState,
+): Promise<void> {
+  await writeSessionMetadata(workspaceRoot, state.metadata)
+  const dir = join(workspaceRoot, '.vibe/sessions')
+  await writeFile(join(dir, `${state.metadata.id}.state.json`), `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+}
+
+export async function readSessionState(workspaceRoot: string, sessionId: string): Promise<SessionState> {
+  const statePath = join(workspaceRoot, '.vibe/sessions', `${sessionId}.state.json`)
+  try {
+    return sanitizeSessionState(JSON.parse(await readFile(statePath, 'utf8')))
+  } catch {
+    const metadata = JSON.parse(await readFile(join(workspaceRoot, '.vibe/sessions', `${sessionId}.json`), 'utf8')) as SessionMetadata
+    return { metadata, messages: legacyMessages(metadata) }
+  }
+}
+
 export async function listSessionMetadata(workspaceRoot: string): Promise<SessionMetadata[]> {
   const dir = join(workspaceRoot, '.vibe/sessions')
   let entries: string[]
@@ -45,7 +70,7 @@ export async function listSessionMetadata(workspaceRoot: string): Promise<Sessio
   }
   const sessions = await Promise.all(
     entries
-      .filter(name => name.endsWith('.json'))
+      .filter(name => name.endsWith('.json') && !name.endsWith('.state.json'))
       .map(async name => {
         try {
           return JSON.parse(await readFile(join(dir, name), 'utf8')) as SessionMetadata
@@ -143,4 +168,37 @@ function summarizeInput(input: unknown): string {
   } catch {
     return String(input)
   }
+}
+
+function sanitizeSessionState(value: unknown): SessionState {
+  const record = value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+  const metadata = record.metadata as SessionMetadata
+  const messages = Array.isArray(record.messages) ? record.messages : []
+  return {
+    metadata,
+    messages: messages
+      .map((message): ChatMessage | undefined => {
+        const rec = message && typeof message === 'object' ? (message as Record<string, unknown>) : {}
+        const role = rec.role
+        const content = rec.content
+        if ((role !== 'user' && role !== 'assistant' && role !== 'tool' && role !== 'system') || typeof content !== 'string') return undefined
+        const sanitized: ChatMessage = {
+          role,
+          content,
+        }
+        if (typeof rec.toolName === 'string') sanitized.toolName = rec.toolName
+        if (Array.isArray(rec.images)) sanitized.images = rec.images.filter((item): item is string => typeof item === 'string')
+        return sanitized
+      })
+      .filter((message): message is ChatMessage => Boolean(message)),
+  }
+}
+
+function legacyMessages(metadata: SessionMetadata): ChatMessage[] {
+  const messages: ChatMessage[] = []
+  if (metadata.lastUserPrompt.trim()) messages.push({ role: 'user', content: metadata.lastUserPrompt })
+  if (metadata.compactSummary.trim() && metadata.compactSummary !== 'turn started') {
+    messages.push({ role: 'assistant', content: metadata.compactSummary })
+  }
+  return messages
 }

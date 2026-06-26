@@ -23,16 +23,21 @@ export async function dumpContext(
   query: string,
   tokenBudget = DEFAULT_CONTEXT_TOKEN_BUDGET,
 ): Promise<DumpContextResult> {
+  if (tokenBudget < 32) {
+    return { content: '[no workspace context budget remaining]', approxTokens: 0, files: [], source: 'fallback' }
+  }
+  const graphHeader = '# Graph Context (SQLite/FTS + dependency expansion)\n'
   const graphContext = await retrieveGraphContext(workspaceRoot, query, {
-    tokenBudget: Math.floor(tokenBudget * (1 - REPO_MAP_SHARE)),
+    tokenBudget: Math.max(0, tokenBudget - approxTokens(graphHeader)),
   }).catch(() => undefined)
   if (graphContext) {
+    const content = clampToTokens([
+      graphHeader.trimEnd(),
+      graphContext.content || '[no graph matches]',
+    ].join('\n'), tokenBudget)
     return {
-      content: [
-        '# Graph Context (SQLite/FTS + dependency expansion)',
-        graphContext.content || '[no graph matches]',
-      ].join('\n'),
-      approxTokens: graphContext.approxTokens,
+      content,
+      approxTokens: approxTokens(content),
       files: graphContext.files,
       source: 'graph',
       indexedAt: graphContext.indexedAt,
@@ -43,19 +48,21 @@ export async function dumpContext(
   const repoMap = await buildRepoMap(workspaceRoot, graph)
   const snippets = await retrieveSnippets(workspaceRoot, repoMap, graph, query, 16)
 
-  const repoMapBudget = Math.floor(tokenBudget * REPO_MAP_SHARE)
-  const snippetBudget = tokenBudget - repoMapBudget
+  const framing = '# Repo Map (most-referenced first; `·` = not exported)\n\n# Relevant Code\n'
+  const contentBudget = Math.max(0, tokenBudget - approxTokens(framing))
+  const repoMapBudget = Math.floor(contentBudget * REPO_MAP_SHARE)
+  const snippetBudget = contentBudget - repoMapBudget
 
   const repoMapText = fitRepoMap(repoMap, repoMapBudget)
   const { text: snippetText, files } = fitSnippets(snippets, snippetBudget)
 
-  const content = [
+  const content = clampToTokens([
     '# Repo Map (most-referenced first; `·` = not exported)',
     repoMapText,
     '',
     '# Relevant Code',
     snippetText || '[no strongly-matching files]',
-  ].join('\n')
+  ].join('\n'), tokenBudget)
 
   return { content, approxTokens: approxTokens(content), files, source: 'fallback' }
 }
@@ -78,12 +85,23 @@ function fitSnippets(snippets: RetrievedSnippet[], budget: number): { text: stri
   for (const snippet of snippets) {
     const block = `## ${snippet.path}  (score=${snippet.score}, ${snippet.reason})\n\`\`\`\n${snippet.content}\n\`\`\``
     const cost = approxTokens(block)
-    if (used + cost > budget && files.length > 0) break
-    blocks.push(block)
+    const fitted = fitBlock(block, budget - used)
+    if (!fitted) break
+    blocks.push(fitted)
     files.push(snippet.path)
-    used += cost
+    used += approxTokens(fitted)
+    if (cost > budget - used) break
   }
   return { text: blocks.join('\n\n'), files }
+}
+
+function fitBlock(block: string, tokenBudget: number): string | undefined {
+  if (tokenBudget <= 0) return undefined
+  if (approxTokens(block) <= tokenBudget) return block
+  const marker = '\n... (context budget truncated)'
+  const maxChars = tokenBudget * CHARS_PER_TOKEN - marker.length
+  if (maxChars < 80) return undefined
+  return `${block.slice(0, maxChars)}${marker}`
 }
 
 function approxTokens(text: string): number {

@@ -4,7 +4,9 @@ import { extname, join, relative } from 'path'
 import { dirname, resolve as posixResolve } from 'path/posix'
 import { SKIP_DIRS } from '@/tools/walk.ts'
 
-const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'])
+// Config files are graph entities too: they define package/runtime boundaries even
+// though they do not participate in import resolution.
+const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.json', '.toml', '.yml', '.yaml'])
 const MAX_DEPTH = 12
 const MAX_FILES = 5_000
 const IMPORT_PATTERN =

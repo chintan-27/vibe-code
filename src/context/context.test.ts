@@ -132,4 +132,76 @@ describe('GraphRAG index', () => {
     expect(result?.files).toContain('src/caller.ts')
     expect(await graphIndexStatus(ws)).toContain('GraphRAG index: fresh')
   })
+
+  test('renders the matching symbol chunk instead of the start of its file', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-graph-chunk-'))
+    await mkdir(join(ws, 'src'))
+    await writeFile(
+      join(ws, 'src', 'service.ts'),
+      [
+        'export function unrelatedBootstrap() {',
+        '  return "not the requested implementation"',
+        '}',
+        '',
+        'export function parseTokens(input: string) {',
+        '  return input.split(/\\s+/)',
+        '}',
+      ].join('\n'),
+      'utf8',
+    )
+
+    const index = await buildGraphIndex(ws)
+    const entityCount = (index.db.query('select count(*) as count from entities').get() as { count: number }).count
+    expect(entityCount).toBeGreaterThan(1)
+    index.close()
+
+    const result = await retrieveGraphContext(ws, 'parseTokens', { limit: 3 })
+    expect(result?.content).toContain('function parseTokens')
+    expect(result?.content).not.toContain('unrelatedBootstrap')
+  })
+
+  test('uses community summaries for broad architecture questions', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-graph-global-'))
+    await mkdir(join(ws, 'src', 'tui'), { recursive: true })
+    await mkdir(join(ws, 'src', 'loop'), { recursive: true })
+    await writeFile(join(ws, 'src', 'loop', 'session.ts'), 'export function runSession() { return "ok" }\n', 'utf8')
+    await writeFile(
+      join(ws, 'src', 'tui', 'app.ts'),
+      "import { runSession } from '../loop/session.ts'\nexport const app = () => runSession()\n",
+      'utf8',
+    )
+
+    const index = await buildGraphIndex(ws)
+    const communities = (index.db.query('select count(*) as count from communities').get() as { count: number }).count
+    index.close()
+    expect(communities).toBe(2)
+
+    const result = await retrieveGraphContext(ws, 'What are the major architectural subsystems and how do they interact?', { tokenBudget: 2_000 })
+    expect(result?.content).toContain('# Architecture Communities')
+    expect(result?.content).toContain('src/tui')
+    expect(result?.content).toContain('src/loop')
+    expect(result?.content).toContain('Connects to: src/loop')
+  })
+
+  test('records package, route, test, and configuration entities', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-graph-entities-'))
+    await mkdir(join(ws, 'src'))
+    await writeFile(join(ws, 'package.json'), '{"scripts":{"test":"bun test"}}\n', 'utf8')
+    await writeFile(
+      join(ws, 'src', 'routes.ts'),
+      "import express from 'express'\nconst router = express.Router()\nrouter.get('/health', () => 'ok')\nexport { router }\n",
+      'utf8',
+    )
+    await writeFile(join(ws, 'src', 'routes.test.ts'), "import { router } from './routes.ts'\ntest('health', () => router)\n", 'utf8')
+
+    const index = await buildGraphIndex(ws)
+    const kinds = index.db.query('select kind from entities').all() as { kind: string }[]
+    const entityKinds = kinds.map(row => row.kind)
+    index.close()
+
+    expect(entityKinds).toContain('package')
+    expect(entityKinds).toContain('route')
+    expect(entityKinds).toContain('test')
+    expect(entityKinds).toContain('config')
+  })
 })

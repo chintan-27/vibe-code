@@ -1,8 +1,8 @@
 import { Box, render, Text, useApp, useInput, useStdout, type Key } from 'ink'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AgentSession } from '@/loop/session.ts'
-import { initializeProject } from '@/cli/init.ts'
-import { buildGraphIndex, graphIndexStatus } from '@/context/graph/index.ts'
+import { initializeProject, type InitProgress } from '@/cli/init.ts'
+import { buildGraphIndex, graphIndexStatus, type GraphIndexProgress } from '@/context/graph/index.ts'
 import type {
   EffortMode,
   ContextInfo,
@@ -19,11 +19,12 @@ import { tmpdir } from 'os'
 import { isTrusted, trustDir } from '@/config/trust.ts'
 import { getModelProfile } from '@/provider/models.ts'
 import { OllamaClient } from '@/provider/ollama.ts'
+import type { ChatMessage } from '@/provider/types.ts'
 import { stripThinkBlocks } from '@/toolcall/parse.ts'
 import { coreTools } from '@/tools/registry.ts'
 import type { AnyTool } from '@/tools/types.ts'
 import type { HooksConfig } from '@/hooks/hooks.ts'
-import { listCheckpoints, listSessionMetadata, restoreCheckpoint } from '@/loop/workflow.ts'
+import { listCheckpoints, listSessionMetadata, readSessionState, restoreCheckpoint, type SessionMetadata } from '@/loop/workflow.ts'
 import {
   extensionInfo,
   extensionSummary,
@@ -47,6 +48,7 @@ export type TuiOptions = {
 
 type PendingPermission = { request: PermissionRequest; resolve: (d: PermissionDecision) => void }
 type PendingQuestion = { question: string; options?: string[]; resolve: (answer: string) => void }
+type PendingResume = { sessions: SessionMetadata[]; selected: number }
 
 type ToolEntry = { name: string; args: string; raw?: unknown; ok?: boolean; result?: string }
 
@@ -54,7 +56,6 @@ type Block =
   | { kind: 'banner'; id: number; model: string; workspace: string; effort: EffortMode }
   | { kind: 'user'; id: number; text: string }
   | { kind: 'assistant'; id: number; text: string }
-  | { kind: 'reasoning'; id: number; text: string }
   | { kind: 'tool'; id: number; tool: ToolEntry }
   | { kind: 'note'; id: number; text: string }
   | { kind: 'notice'; id: number; notice: RuntimeNotice }
@@ -66,6 +67,19 @@ type Live = {
   think: string
   tools: ToolEntry[]
   notices: RuntimeNotice[]
+  init?: InitProgress
+  job?: LiveJob
+}
+
+type LiveJob = {
+  kind: 'index' | 'plugin'
+  pct: number
+  label: string
+  message: string
+  stage: string
+  phases: string[]
+  current?: number
+  total?: number
 }
 
 type SlashCommand = {
@@ -145,8 +159,7 @@ const COMMANDS: SlashCommand[] = [
   { name: '/context', hint: 'toggle context panel', args: '[query]' },
   { name: '/diff', hint: 'show git summary' },
   { name: '/rewind', hint: 'list checkpoints', args: '[id]' },
-  { name: '/sessions', hint: 'list saved sessions' },
-  { name: '/resume', hint: 'planned resume entry', args: '<id>' },
+  { name: '/resume', hint: 'list or resume saved sessions', args: '[id]' },
   { name: '/commit', hint: 'commit current changes' },
   { name: '/review', hint: 'review working tree' },
   { name: '/plan', hint: 'toggle read-only planning' },
@@ -200,16 +213,17 @@ export function App({ options }: { options: TuiOptions }) {
   const [cursorView, setCursorView] = useState(0)
   const [history, setHistory] = useState<string[]>([])
   const [historyIdx, setHistoryIdx] = useState(-1)
-  const [showReasoning, setShowReasoning] = useState(false) // thinking lives in the background; ^R to expand
   const [showContext, setShowContext] = useState(false)
   const [permMode, setPermMode] = useState<PermissionMode>(options.permissionMode)
   const [pendingPermission, setPendingPermission] = useState<PendingPermission | null>(null)
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null)
+  const [pendingResume, setPendingResume] = useState<PendingResume | null>(null)
   const [qIndex, setQIndex] = useState(0) // highlighted option in a question prompt
   const [qTyping, setQTyping] = useState(false) // chose "type my own answer"
   const [frame, setFrame] = useState(0)
   const [trusted, setTrusted] = useState(() => isTrusted(options.workspaceRoot))
   const [commandIndex, setCommandIndex] = useState(0)
+  const [scrollOffset, setScrollOffset] = useState(0)
   const idRef = useRef(0)
   const nextId = () => (idRef.current += 1)
 
@@ -371,6 +385,7 @@ export function App({ options }: { options: TuiOptions }) {
     abortRef.current = controller
     setLive({ active: true, assistant: '', think: '', tools: [], notices: [] })
     setTokensThisTurn(0)
+    setScrollOffset(0)
 
     let result
     try {
@@ -391,7 +406,6 @@ export function App({ options }: { options: TuiOptions }) {
     // Finalize the live turn into scrollback blocks.
     const current = liveRef.current
     const finalized: Block[] = []
-    if (current.think.trim()) finalized.push({ kind: 'reasoning', id: nextId(), text: current.think.trim() })
     for (const tool of current.tools) finalized.push({ kind: 'tool', id: nextId(), tool })
     const answer = stripThinkBlocks(current.assistant).trim() || stripThinkBlocks(result.finalContent).trim()
     if (answer) finalized.push({ kind: 'assistant', id: nextId(), text: answer })
@@ -404,6 +418,32 @@ export function App({ options }: { options: TuiOptions }) {
     pendingPermission?.resolve(decision)
     setPendingPermission(null)
   }
+
+  const restoreSession = useCallback(async (sessionId: string) => {
+    try {
+      const state = await readSessionState(options.workspaceRoot, sessionId)
+      sessionRef.current?.restore(state)
+      setTranscript([
+        {
+          kind: 'banner',
+          id: nextId(),
+          model: profile.model,
+          workspace: options.workspaceRoot,
+          effort,
+        },
+        ...messagesToTranscript(state.messages, nextId),
+      ])
+      setHistory(state.messages.filter(message => message.role === 'user').map(message => message.content))
+      setHistoryIdx(-1)
+      setPendingResume(null)
+    } catch (error) {
+      setTranscript(prev => [
+        ...prev,
+        { kind: 'note', id: nextId(), text: `resume failed: ${error instanceof Error ? error.message : String(error)}` },
+      ])
+      setPendingResume(null)
+    }
+  }, [effort, options.workspaceRoot, profile.model])
 
   // Shared text editing: cursor movement, edits, paste-safe submit. A return that
   // arrives right after a keystroke is a pasted newline (inserted literally), not submit.
@@ -440,18 +480,26 @@ export function App({ options }: { options: TuiOptions }) {
     if (text === '/exit' || text === '/quit') return exit()
     if (text === '/help') return setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: HELP }])
     if (text === '/context index') {
-      setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: 'Building GraphRAG index…' }])
+      const start = graphProgressToJob({ phase: 'scan', message: 'Scanning dependency graph' })
+      liveRef.current = { active: true, assistant: '', think: '', tools: [], notices: [], job: start }
+      setLive({ active: true, assistant: '', think: '', tools: [], notices: [], job: start })
+      turnStartRef.current = Date.now()
       void buildGraphIndex(options.workspaceRoot, {
         onProgress: progress => {
-          setTranscript(prev => [...prev, { kind: 'notice', id: nextId(), notice: { level: 'info', title: 'GraphRAG indexing', message: progress.message } }])
+          liveRef.current.job = graphProgressToJob(progress)
+          dirtyRef.current = true
         },
       })
         .then(index => {
           const stats = index.stats
           index.close()
+          liveRef.current = freshLive()
+          setLive(freshLive())
           setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `GraphRAG indexed ${stats.files} files, ${stats.symbols} symbols, ${stats.chunks} chunks, ${stats.edges} edges.` }])
         })
         .catch(error => {
+          liveRef.current = freshLive()
+          setLive(freshLive())
           setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `GraphRAG index failed: ${error instanceof Error ? error.message : String(error)}` }])
         })
       return
@@ -470,9 +518,28 @@ export function App({ options }: { options: TuiOptions }) {
     if (text === '/commit') return void submit(COMMIT_PROMPT)
     if (text === '/review') return void submit(REVIEW_PROMPT)
     if (text.startsWith('/plugins')) {
-      void runPluginCommand(options.workspaceRoot, text.slice('/plugins'.length).trim(), options.extensionSettings).then(message => {
-        setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: message }])
-      })
+      const job: LiveJob = {
+        kind: 'plugin',
+        pct: 35,
+        label: 'Plugin command',
+        message: text,
+        stage: 'run',
+        phases: ['prepare', 'run', 'done'],
+      }
+      liveRef.current = { active: true, assistant: '', think: '', tools: [], notices: [], job }
+      setLive({ active: true, assistant: '', think: '', tools: [], notices: [], job })
+      turnStartRef.current = Date.now()
+      void runPluginCommand(options.workspaceRoot, text.slice('/plugins'.length).trim(), options.extensionSettings)
+        .then(message => {
+          liveRef.current = freshLive()
+          setLive(freshLive())
+          setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: message }])
+        })
+        .catch(error => {
+          liveRef.current = freshLive()
+          setLive(freshLive())
+          setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: `plugins failed: ${error instanceof Error ? error.message : String(error)}` }])
+        })
       return
     }
     if (text === '/plan') {
@@ -492,15 +559,32 @@ export function App({ options }: { options: TuiOptions }) {
       return
     }
     if (text === '/init') {
-      setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: 'Analyzing repository and writing VIBE.md…' }])
-      void initializeProject(options.workspaceRoot, client)
+      const start: InitProgress = {
+        stage: 'context',
+        pct: 1,
+        label: 'Starting init',
+        message: 'Preparing repository analysis.',
+      }
+      liveRef.current = { active: true, assistant: '', think: '', tools: [], notices: [], init: start }
+      setLive({ active: true, assistant: '', think: '', tools: [], notices: [], init: start })
+      turnStartRef.current = Date.now()
+      void initializeProject(options.workspaceRoot, client, {
+        onProgress: progress => {
+          liveRef.current.init = progress
+          dirtyRef.current = true
+        },
+      })
         .then(result => {
+          liveRef.current = freshLive()
+          setLive(freshLive())
           setTranscript(prev => [
             ...prev,
             { kind: 'note', id: nextId(), text: `Wrote ${result.path} and seeded a ${result.memoryName} memory.` },
           ])
         })
         .catch(error => {
+          liveRef.current = freshLive()
+          setLive(freshLive())
           setTranscript(prev => [
             ...prev,
             { kind: 'note', id: nextId(), text: `init failed: ${error instanceof Error ? error.message : String(error)}` },
@@ -543,25 +627,19 @@ export function App({ options }: { options: TuiOptions }) {
         })
       return
     }
-    if (text === '/sessions') {
-      void listSessionMetadata(options.workspaceRoot).then(sessions => {
-        setTranscript(prev => [
-          ...prev,
-          {
-            kind: 'note',
-            id: nextId(),
-            text: sessions.length === 0 ? 'No saved sessions yet.' : sessions.map(s => `${s.id}  ${s.updatedAt}  ${s.title}`).join('\n'),
-          },
-        ])
-      })
-      return
-    }
     if (text.startsWith('/resume')) {
       const id = text.split(/\s+/)[1]
-      return setTranscript(prev => [
-        ...prev,
-        { kind: 'note', id: nextId(), text: id ? `Resume ${id} is planned, but full resume is not available yet.` : 'usage: /resume <session-id>' },
-      ])
+      if (id) {
+        return void restoreSession(id)
+      }
+      void listSessionMetadata(options.workspaceRoot).then(sessions => {
+        if (sessions.length === 0) {
+          setTranscript(prev => [...prev, { kind: 'note', id: nextId(), text: 'No saved sessions yet.' }])
+          return
+        }
+        setPendingResume({ sessions, selected: 0 })
+      })
+      return
     }
     if (text.startsWith('/image')) {
       const rest = text.slice('/image'.length).trim()
@@ -640,12 +718,36 @@ export function App({ options }: { options: TuiOptions }) {
       editText(value, key, resolveQuestion)
       return
     }
-    if (key.ctrl && value === 'r') {
-      setShowReasoning(s => !s)
+    if (pendingResume) {
+      if (key.upArrow) {
+        setPendingResume(current => current ? { ...current, selected: (current.selected - 1 + current.sessions.length) % current.sessions.length } : current)
+        return
+      }
+      if (key.downArrow) {
+        setPendingResume(current => current ? { ...current, selected: (current.selected + 1) % current.sessions.length } : current)
+        return
+      }
+      if (key.escape) {
+        setPendingResume(null)
+        return
+      }
+      if (key.return) {
+        const session = pendingResume.sessions[pendingResume.selected]
+        if (session) void restoreSession(session.id)
+        return
+      }
       return
     }
     if (key.ctrl && value === 'o') {
       setShowContext(s => !s)
+      return
+    }
+    if (key.pageUp) {
+      setScrollOffset(s => s + 5)
+      return
+    }
+    if (key.pageDown) {
+      setScrollOffset(s => Math.max(0, s - 5))
       return
     }
     // Esc interrupts the running turn (model + tools abort, back to the prompt).
@@ -709,9 +811,12 @@ export function App({ options }: { options: TuiOptions }) {
     (suggestions.length > 0 && !live.active ? Math.min(9, suggestions.length * 2 + 3) : 0) +
     (pendingPermission ? 10 : 0) +
     (pendingQuestion ? 8 : 0) +
+    (pendingResume ? Math.min(12, pendingResume.sessions.length + 6) : 0) +
     (showContext ? 8 : 0)
   const transcriptRows = Math.max(4, height - reservedRows)
-  const visibleTranscript = selectVisibleBlocks(transcript, transcriptRows)
+  const compactBanner = (suggestions.length > 0 || pendingResume !== null) && !live.active
+  const clampedScroll = Math.min(scrollOffset, Math.max(0, transcript.length - 1))
+  const visibleTranscript = selectVisibleBlocks(transcript, transcriptRows, compactBanner, mainWidth, clampedScroll)
 
   const completeCommand = (command?: string) => {
     if (!command) return
@@ -722,7 +827,7 @@ export function App({ options }: { options: TuiOptions }) {
   if (!trusted) {
     return (
       <Box flexDirection="column" width={width} height={height}>
-        <BannerView model={profile.model} workspace={options.workspaceRoot} effort={effort} width={width} />
+        <BannerView model={profile.model} workspace={options.workspaceRoot} effort={effort} width={width} compact />
         <TrustGate workspace={options.workspaceRoot} width={width} />
       </Box>
     )
@@ -732,8 +837,11 @@ export function App({ options }: { options: TuiOptions }) {
     <Box flexDirection="column" width={width} height={height}>
       <Box flexDirection="column" width={width} flexGrow={1} flexShrink={1}>
         <Box flexDirection="column" width={mainWidth} flexGrow={1} flexShrink={1}>
+          {clampedScroll > 0 && (
+            <Text color={C.muted} dimColor>{`  ↑ scrolled back · PgDn↓ to return`}</Text>
+          )}
           {visibleTranscript.map(block => (
-            <BlockView key={block.id} block={block} width={mainWidth} />
+            <BlockView key={block.id} block={block} width={mainWidth} compactBanner={compactBanner} />
           ))}
 
           {!wide && showContext && context.files.length > 0 && <ContextPanel context={context} width={mainWidth} />}
@@ -741,9 +849,9 @@ export function App({ options }: { options: TuiOptions }) {
           {live.active && (
             <LiveTurnView
               live={live}
-              showReasoning={showReasoning}
               elapsedS={elapsedS}
               frame={frame}
+              tokPerSec={tokPerSec}
               width={mainWidth}
             />
           )}
@@ -760,6 +868,7 @@ export function App({ options }: { options: TuiOptions }) {
           width={width}
         />
       )}
+      {pendingResume && <ResumeSelector sessions={pendingResume.sessions} selected={pendingResume.selected} width={width} />}
 
       {wide && showContext && (
         <TopDashboard
@@ -848,7 +957,8 @@ function MissionBar(props: {
       </Box>
       <Text color={C.muted}>
         {'ctx '}
-        <Text color={C.accent}>{`${pct}%`}</Text>
+        <Text color={C.accent}>{meter(pct, 8)}</Text>
+        <Text color={C.muted}>{` ${pct}%`}</Text>
         {` · ${formatTokens(props.context.approxTokens)}/${formatTokens(budget)} · ${props.tokPerSec} tok/s`}
       </Text>
     </Box>
@@ -857,29 +967,47 @@ function MissionBar(props: {
 
 function LiveTurnView({
   live,
-  showReasoning,
   elapsedS,
   frame,
+  tokPerSec,
   width,
 }: {
   live: Live
-  showReasoning: boolean
   elapsedS: number
   frame: number
+  tokPerSec: number
   width: number
 }) {
+  if (live.init) return <InitProgressView progress={live.init} elapsedS={elapsedS} frame={frame} tokPerSec={tokPerSec} width={width} />
+  if (live.job) return <JobProgressView job={live.job} elapsedS={elapsedS} frame={frame} tokPerSec={tokPerSec} width={width} />
+  const progress = liveProgress(live)
+  const doneTools = live.tools.filter(tool => tool.ok !== undefined).length
+  const failedTools = live.tools.filter(tool => tool.ok === false).length
+  const pendingTool = live.tools.find(tool => tool.ok === undefined)
   return (
-    <Box flexDirection="column">
-      {live.think.trim() !== '' &&
-        (showReasoning ? (
-          <ReasoningView text={live.think} live />
-        ) : (
-          <Box marginTop={1}>
-            <Text color={C.muted} dimColor>
-              {`${G.reasoning} thinking… ${formatTokens(approxTokens(live.think))} · ${elapsedS}s · ^R to expand`}
-            </Text>
-          </Box>
-        ))}
+    <Box flexDirection="column" borderStyle="round" borderColor={C.brand} paddingX={1} marginTop={1} width={width}>
+      <Box>
+        <Text color={C.brandBright}>{`${SPINNER[frame]} `}</Text>
+        <Text color={C.brandBright} bold>{progress.label}</Text>
+        <Text color={C.muted} dimColor>{`… streaming · ${tokPerSec} tok/s · ${elapsedS}s · esc to interrupt`}</Text>
+      </Box>
+      <Text color={C.muted}>
+        <Text color={progress.stage === 'thinking' ? C.brandBright : C.muted}>{phaseDot(progress.stage === 'thinking')} think</Text>
+        <Text color={C.muted}>  </Text>
+        <Text color={progress.stage === 'drafting' ? C.accentBright : C.muted}>{phaseDot(progress.stage === 'drafting')} draft</Text>
+        <Text color={C.muted}>  </Text>
+        <Text color={progress.stage === 'tools' ? C.warn : C.muted}>{phaseDot(progress.stage === 'tools')} tools</Text>
+        <Text color={C.muted}>  </Text>
+        <Text color={progress.stage === 'answering' ? C.ok : C.muted}>{phaseDot(progress.stage === 'answering')} answer</Text>
+        <Text color={C.muted} dimColor>
+          {`   ${doneTools}/${live.tools.length} tools${failedTools ? ` · ${failedTools} failed` : ''}${pendingTool ? ` · ${toolTitle(pendingTool.name)}` : ''}`}
+        </Text>
+      </Text>
+      {live.think.trim() !== '' && (
+        <Box>
+          <Text color={C.muted} dimColor>{`${G.reasoning} thinking… ${elapsedS}s`}</Text>
+        </Box>
+      )}
       {live.tools.map((tool, i) => (
         <ToolView key={`live-tool-${i}`} tool={tool} width={width} />
       ))}
@@ -887,22 +1015,86 @@ function LiveTurnView({
         <NoticeView key={`live-notice-${i}-${notice.title}`} notice={notice} />
       ))}
       {live.assistant.trim() !== '' && !looksLikeToolDraft(live.assistant) && (
-        <Box marginTop={1}>
-          <Text>
+        <Box marginTop={1} flexDirection="column">
+          <Box>
             <Text color={C.brand} bold>
               {G.assistant}
             </Text>
-            {` ${stripThinkBlocks(live.assistant)}`}
-          </Text>
+            <Text color={C.accent}>▏</Text>
+          </Box>
+          <MarkdownView text={stripThinkBlocks(live.assistant)} width={Math.max(20, width - 4)} />
         </Box>
       )}
-      <Box marginTop={1}>
-        <Text color={C.brandBright}>{`${SPINNER[frame]} `}</Text>
-        <Text color={C.muted}>{`${spinnerLabel(live)}  ${elapsedS}s`}</Text>
-        <Text color={C.muted} dimColor>
-          {'   ·  Esc stop'}
-        </Text>
+    </Box>
+  )
+}
+
+function JobProgressView({
+  job,
+  elapsedS,
+  frame,
+  tokPerSec,
+  width,
+}: {
+  job: LiveJob
+  elapsedS: number
+  frame: number
+  tokPerSec: number
+  width: number
+}) {
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={job.kind === 'index' ? C.accent : C.brand} paddingX={1} marginTop={1} width={width}>
+      <Box>
+        <Text color={C.accentBright}>{`${SPINNER[frame]} `}</Text>
+        <Text color={C.accentBright} bold>{job.label}</Text>
+        <Text color={C.muted} dimColor>{`… ${job.kind} · ${job.pct}% · ${tokPerSec} tok/s · ${elapsedS}s · esc to interrupt`}</Text>
       </Box>
+      <Text color={C.muted}>
+        {job.phases.map((phase, i) => (
+          <Text key={`job-phase-${phase}`} color={phase === job.stage ? C.accentBright : C.muted}>
+            {`${i === 0 ? '' : '  '}${phaseDot(phase === job.stage)} ${phase}`}
+          </Text>
+        ))}
+        <Text color={C.muted} dimColor>{job.total !== undefined ? `   ${job.current ?? 0}/${job.total}` : ''}</Text>
+      </Text>
+      <Text color={C.muted}>{clip(job.message, Math.max(40, width - 6))}</Text>
+    </Box>
+  )
+}
+
+function InitProgressView({
+  progress,
+  elapsedS,
+  frame,
+  tokPerSec,
+  width,
+}: {
+  progress: InitProgress
+  elapsedS: number
+  frame: number
+  tokPerSec: number
+  width: number
+}) {
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={C.accent} paddingX={1} marginTop={1} width={width}>
+      <Box>
+        <Text color={C.accentBright}>{`${SPINNER[frame]} `}</Text>
+        <Text color={C.accentBright} bold>{progress.label}</Text>
+        <Text color={C.muted} dimColor>{`… init · ${progress.pct}% · ${tokPerSec} tok/s · ${elapsedS}s · esc to interrupt`}</Text>
+      </Box>
+      <Text color={C.muted}>
+        <Text color={progress.stage === 'context' ? C.accentBright : C.muted}>{phaseDot(progress.stage === 'context')} context</Text>
+        <Text color={C.muted}>  </Text>
+        <Text color={progress.stage === 'scan' ? C.accentBright : C.muted}>{phaseDot(progress.stage === 'scan')} scan</Text>
+        <Text color={C.muted}>  </Text>
+        <Text color={progress.stage === 'facts' || progress.stage === 'snippets' ? C.accentBright : C.muted}>{phaseDot(progress.stage === 'facts' || progress.stage === 'snippets')} evidence</Text>
+        <Text color={C.muted}>  </Text>
+        <Text color={progress.stage === 'model' ? C.brandBright : C.muted}>{phaseDot(progress.stage === 'model')} model</Text>
+        <Text color={C.muted}>  </Text>
+        <Text color={progress.stage === 'write' || progress.stage === 'memory' || progress.stage === 'done' ? C.ok : C.muted}>{phaseDot(progress.stage === 'write' || progress.stage === 'memory' || progress.stage === 'done')} save</Text>
+        <Text color={C.muted} dimColor>{progress.files !== undefined ? `   ${progress.files} files` : ''}</Text>
+      </Text>
+      <Text color={C.muted}>{clip(progress.message, Math.max(40, width - 6))}</Text>
     </Box>
   )
 }
@@ -939,7 +1131,7 @@ function TopDashboard(props: {
       <Box flexDirection="column" flexGrow={1}>
         <Text color={C.accent} bold>Activity</Text>
         <Text color={activeTool ? C.warn : C.muted}>{activeTool ? `running ${toolTitle(activeTool.name)}` : 'idle'}</Text>
-        <Text color={C.muted}>{`${props.live.tools.length} tools · ${props.live.notices.length} notices · ^R reasoning · / commands`}</Text>
+        <Text color={C.muted}>{`${props.live.tools.length} tools · ${props.live.notices.length} notices · / commands`}</Text>
       </Box>
     </Box>
   )
@@ -999,8 +1191,8 @@ function commandDescription(name: string): string {
       return 'Toggle read-only mode: propose writes/edits/commands without executing them.'
     case '/plugins':
       return 'Install and manage local skills, MCP plugins, JS plugins, and registry entries.'
-    case '/sessions':
-      return 'List saved local session metadata.'
+    case '/resume':
+      return 'Open saved-session selector, or restore a session by id.'
     default:
       return 'Run command or insert it into the composer.'
   }
@@ -1054,13 +1246,14 @@ async function runPluginCommand(workspaceRoot: string, input: string, settings?:
   }
 }
 
-function selectVisibleBlocks(blocks: Block[], maxRows: number): Block[] {
+function selectVisibleBlocks(blocks: Block[], maxRows: number, compactBanner: boolean, width: number, scrollOffset = 0): Block[] {
   let used = 0
   const out: Block[] = []
-  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+  const end = Math.max(0, blocks.length - scrollOffset)
+  for (let i = end - 1; i >= 0; i -= 1) {
     const block = blocks[i]
     if (!block) continue
-    const rows = estimateBlockRows(block)
+    const rows = estimateBlockRows(block, compactBanner, width)
     if (out.length > 0 && used + rows > maxRows) break
     out.unshift(block)
     used += rows
@@ -1068,55 +1261,45 @@ function selectVisibleBlocks(blocks: Block[], maxRows: number): Block[] {
   return out
 }
 
-function estimateBlockRows(block: Block): number {
-  if (block.kind === 'banner') return 12
+function estimateBlockRows(block: Block, compactBanner: boolean, width = 100): number {
+  if (block.kind === 'banner') return compactBanner ? 7 : 15
   if (block.kind === 'tool') return block.tool.name === 'Edit' ? 6 : 3
   if (block.kind === 'plan') return block.actions.length + 3
   if (block.kind === 'notice') return 3
-  return Math.min(8, Math.max(2, 'text' in block ? block.text.split('\n').length + 1 : 2))
+  if ('text' in block) return Math.min(16, Math.max(2, estimateWrappedRows(block.text, Math.max(20, width - 4)) + 1))
+  return 2
 }
 
-function BlockView({ block, width }: { block: Block; width: number }) {
+function BlockView({ block, width, compactBanner }: { block: Block; width: number; compactBanner: boolean }) {
   if (block.kind === 'banner') {
-    return <BannerView model={block.model} workspace={block.workspace} effort={block.effort} width={width} />
+    return <BannerView model={block.model} workspace={block.workspace} effort={block.effort} width={width} compact={compactBanner} />
   }
   if (block.kind === 'user') {
     return (
-      <Box marginTop={1}>
+      <Box marginTop={1} width={width}>
         <Text color={C.accent} bold>{`${G.user} `}</Text>
-        <Text color={C.accent} bold>
-          {block.text}
-        </Text>
+        <Text color={C.accent} bold>{wrapText(block.text, Math.max(20, width - 3))}</Text>
       </Box>
     )
   }
   if (block.kind === 'assistant') {
     return (
-      <Box marginTop={1}>
-        <Text>
+      <Box marginTop={1} width={width}>
+        <Box>
           <Text color={C.brand} bold>
             {G.assistant}
           </Text>
-          {` ${block.text}`}
-        </Text>
-      </Box>
-    )
-  }
-  if (block.kind === 'reasoning') {
-    // Thinking is kept in the background — a dim one-liner in scrollback.
-    return (
-      <Box marginTop={1}>
-        <Text color={C.muted} dimColor>
-          {`${G.reasoning} thought for ${approxTokens(block.text)} tok`}
-        </Text>
+          <Text>{' '}</Text>
+        </Box>
+        <MarkdownView text={block.text} width={Math.max(20, width - 2)} />
       </Box>
     )
   }
   if (block.kind === 'note') {
     return (
-      <Box marginTop={1}>
+      <Box marginTop={1} width={width}>
         <Text color={C.warn}>{`${G.note} `}</Text>
-        <Text color={C.muted}>{block.text}</Text>
+        <MarkdownView text={block.text} width={Math.max(20, width - 3)} muted />
       </Box>
     )
   }
@@ -1129,6 +1312,135 @@ function BlockView({ block, width }: { block: Block; width: number }) {
   return <ToolView tool={block.tool} width={width} />
 }
 
+function messagesToTranscript(messages: ChatMessage[], nextId: () => number): Block[] {
+  const blocks: Block[] = []
+  for (const message of messages) {
+    const content = stripThinkBlocks(message.content).trim()
+    if (!content) continue
+    if (message.role === 'user') {
+      blocks.push({ kind: 'user', id: nextId(), text: content })
+      continue
+    }
+    if (message.role === 'assistant') {
+      if (looksLikeToolDraft(content)) continue
+      blocks.push({ kind: 'assistant', id: nextId(), text: content })
+      continue
+    }
+    if (message.role === 'tool') {
+      const { ok, result } = parseSavedToolResult(content)
+      blocks.push({
+        kind: 'tool',
+        id: nextId(),
+        tool: {
+          name: message.toolName ?? 'Tool',
+          args: '',
+          ok,
+          result,
+        },
+      })
+    }
+  }
+  return blocks
+}
+
+function parseSavedToolResult(content: string): { ok: boolean; result: string } {
+  if (content.startsWith('ok\n')) return { ok: true, result: content.slice(3) }
+  if (content.startsWith('error\n')) return { ok: false, result: content.slice(6) }
+  return { ok: true, result: content }
+}
+
+function MarkdownView({ text, width, muted = false }: { text: string; width: number; muted?: boolean }) {
+  const lines = text.replace(/\t/g, '  ').split(/\r?\n/)
+  const nodes: React.ReactNode[] = []
+  let inCode = false
+  let paragraph: string[] = []
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return
+    nodes.push(...renderWrappedLine(paragraph.join(' '), width, muted ? C.muted : undefined, `p-${nodes.length}`))
+    paragraph = []
+  }
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('```')) {
+      flushParagraph()
+      inCode = !inCode
+      continue
+    }
+    if (inCode) {
+      nodes.push(
+        <Text key={`code-${nodes.length}`} color={C.accent}>
+          {`  ${wrapText(line, Math.max(10, width - 2))}`}
+        </Text>,
+      )
+      continue
+    }
+    if (!trimmed) {
+      flushParagraph()
+      nodes.push(<Text key={`blank-${nodes.length}`}> </Text>)
+      continue
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(trimmed)
+    if (heading) {
+      flushParagraph()
+      nodes.push(
+        <Text key={`heading-${nodes.length}`} color={C.accentBright} bold>
+          {wrapText(heading[2] ?? '', width)}
+        </Text>,
+      )
+      continue
+    }
+    const list = /^(\d+[.)]|[-*])\s+(.+)$/.exec(trimmed)
+    if (list) {
+      flushParagraph()
+      const marker = list[1] ?? '-'
+      const body = list[2] ?? ''
+      const wrapped = wrapLines(body, Math.max(10, width - marker.length - 2))
+      nodes.push(
+        <Text key={`list-${nodes.length}`} color={muted ? C.muted : undefined}>
+          <Text color={C.accent}>{`${marker} `}</Text>
+          {renderInline(wrapped[0] ?? '')}
+          {wrapped.slice(1).map((extra, i) => `\n${' '.repeat(marker.length + 1)}${extra}`).join('')}
+        </Text>,
+      )
+      continue
+    }
+    paragraph.push(trimmed)
+  }
+  flushParagraph()
+  return <Box flexDirection="column">{nodes}</Box>
+}
+
+function renderWrappedLine(text: string, width: number, color: string | undefined, keyPrefix: string): React.ReactNode[] {
+  return wrapLines(text, width).map((line, i) => (
+    <Text key={`${keyPrefix}-${i}`} color={color}>
+      {renderInline(line)}
+    </Text>
+  ))
+}
+
+function renderInline(line: string): React.ReactNode {
+  const parts = line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g)
+  return (
+    <>
+      {parts.map((part, i) => {
+        if (part.startsWith('`') && part.endsWith('`')) {
+          return (
+          <Text key={`inline-${i}`} color={C.accent}>{part.slice(1, -1)}</Text>
+          )
+        }
+        if (part.startsWith('**') && part.endsWith('**')) {
+          return (
+            <Text key={`inline-${i}`} bold>{part.slice(2, -2)}</Text>
+          )
+        }
+        return part
+      })}
+    </>
+  )
+}
+
+const RULE_COLORS = ['cyan', 'cyanBright', 'magentaBright', 'magenta'] as const
 const LOGO = [
   ' ██╗   ██╗██╗██████╗ ███████╗',
   ' ██║   ██║██║██╔══██╗██╔════╝',
@@ -1137,56 +1449,74 @@ const LOGO = [
   '  ╚████╔╝ ██║██████╔╝███████╗',
   '   ╚═══╝  ╚═╝╚═════╝ ╚══════╝',
 ]
-// Top-to-bottom cyan→magenta gradient across the six logo rows.
 const LOGO_COLORS = ['cyan', 'cyan', 'cyanBright', 'magentaBright', 'magenta', 'magenta'] as const
+
+/** A hairline rule that echoes the cyan coder → magenta reasoner split. */
+function GradientRule({ width }: { width: number }) {
+  const span = Math.max(1, Math.floor(width / RULE_COLORS.length))
+  return (
+    <Text>
+      {RULE_COLORS.map((color, i) => (
+        <Text key={`rule-${i}`} color={color}>
+          {'─'.repeat(i === RULE_COLORS.length - 1 ? Math.max(1, width - span * (RULE_COLORS.length - 1)) : span)}
+        </Text>
+      ))}
+    </Text>
+  )
+}
 
 function BannerView({
   model,
   workspace,
   effort,
   width,
+  compact = false,
 }: {
   model: string
   workspace: string
   effort: EffortMode
   width: number
+  compact?: boolean
 }) {
   const reasoner = getModelProfile('reasoner')
   const coder = getModelProfile('coder')
-  const showLogo = width >= 70
+  const panelWidth = Math.min(width, compact ? 96 : 104)
+  const marginLeft = Math.max(0, Math.floor((width - panelWidth) / 2))
+  const ruleWidth = Math.max(24, Math.min(56, panelWidth - 6))
   return (
-    <Box flexDirection="column" width={width} marginBottom={1}>
-      {showLogo ? (
-        <Box flexDirection="column">
+    <Box flexDirection="column" width={panelWidth} marginLeft={marginLeft} borderStyle="round" borderColor={C.brandBright} paddingX={2}>
+      <Box>
+        <Text color={C.accentBright} bold inverse> VIBE CODE </Text>
+        <Text color={C.muted}>  local-first coding agent</Text>
+        <Box flexGrow={1} />
+        <Badge label="READY" color={C.ok} inverse />
+      </Box>
+      {!compact && (
+        <Box flexDirection="column" borderStyle="single" borderColor={C.accent} paddingX={1} marginTop={1} width={36}>
           {LOGO.map((line, i) => (
             <Text key={`logo-${i}`} color={LOGO_COLORS[i] ?? C.accent} bold>
               {line}
             </Text>
           ))}
-          <Text> </Text>
         </Box>
-      ) : (
-        <Text>
-          <Text color={C.accent} bold>▌ vibe code</Text>
-        </Text>
       )}
+      <GradientRule width={ruleWidth} />
       <Text>
-        <Text bold>Vibe Code</Text>
-        <Text color={C.muted}>{'  ·  local-first coding agent'}</Text>
+        <Text color={C.brand} bold>reason</Text>
+        <Text color={C.muted}>{` ${reasoner.model.replace(':latest', '')}`}</Text>
+        <Text color={C.muted}>{'  ·  '}</Text>
+        <Text color={C.accent} bold>code</Text>
+        <Text color={C.muted}>{` ${model}`}</Text>
       </Text>
       <Text color={C.muted}>
-        {'model   '}
-        <Text color={C.accent}>{model}</Text>
-        {' + '}
-        <Text color={C.brand}>vibethinker</Text>
-        {`   (ctx ${formatTokens(coder.defaults.numCtx)} / ${formatTokens(reasoner.defaults.numCtx)})`}
+        <Text color={C.accent}>ctx </Text>
+        <Text color={C.accent}>{meter(100, 18)}</Text>
+        <Text color={C.muted}>{`  ${formatTokens(coder.defaults.numCtx)} / ${formatTokens(reasoner.defaults.numCtx)}  ·  ${effort} effort`}</Text>
       </Text>
       <Text color={C.muted}>
-        {'cwd     '}
-        <Text>{workspace}</Text>
-      </Text>
-      <Text color={C.muted} dimColor>
-        {`hint    type a task, or /help for commands · ^C quit · effort ${effort}`}
+        <Text color={C.muted} dimColor>{`${G.bullet} `}</Text>
+        {clip(workspace, Math.max(24, panelWidth - 42))}
+        <Text color={C.muted} dimColor>{'  ·  /help  ·  ^C quit'}</Text>
       </Text>
     </Box>
   )
@@ -1195,7 +1525,7 @@ function BannerView({
 function ToolView({ tool, width }: { tool: ToolEntry; width: number }) {
   const dotColor = tool.ok === undefined ? C.warn : tool.ok ? C.ok : C.err
   const isTodos = tool.name === 'TodoWrite' && tool.ok
-  const state = tool.ok === undefined ? 'running' : tool.ok ? 'done' : 'failed'
+  const state = tool.ok === undefined ? 'applying…' : tool.ok ? 'done' : 'failed'
   const maxArg = Math.max(24, Math.min(86, width - 28))
   return (
     <Box flexDirection="column" marginTop={1}>
@@ -1328,6 +1658,78 @@ function clip(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
 }
 
+function wrapText(text: string, width: number): string {
+  return wrapLines(text, width).join('\n')
+}
+
+function wrapLines(text: string, width: number): string[] {
+  const safeWidth = Math.max(8, width)
+  const out: string[] = []
+  for (const raw of text.split(/\r?\n/)) {
+    const words = raw.split(/(\s+)/).filter(part => part.length > 0)
+    let line = ''
+    for (const word of words) {
+      if (/^\s+$/.test(word)) {
+        if (line && !line.endsWith(' ')) line += ' '
+        continue
+      }
+      if (word.length > safeWidth) {
+        if (line.trim()) out.push(line.trimEnd())
+        for (let i = 0; i < word.length; i += safeWidth) out.push(word.slice(i, i + safeWidth))
+        line = ''
+        continue
+      }
+      if ((line + word).length > safeWidth) {
+        if (line.trim()) out.push(line.trimEnd())
+        line = word
+      } else {
+        line += word
+      }
+    }
+    out.push(line.trimEnd())
+  }
+  return out.length > 0 ? out : ['']
+}
+
+function estimateWrappedRows(text: string, width: number): number {
+  let rows = 0
+  let inCode = false
+  let paragraph: string[] = []
+  const flush = () => {
+    if (paragraph.length > 0) {
+      rows += wrapLines(paragraph.join(' '), width).length
+      paragraph = []
+    }
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('```')) {
+      flush()
+      inCode = !inCode
+      continue
+    }
+    if (!trimmed) {
+      flush()
+      rows += 1
+      continue
+    }
+    if (inCode || /^#{1,4}\s+/.test(trimmed)) {
+      flush()
+      rows += wrapLines(trimmed.replace(/^#{1,4}\s+/, ''), width).length
+      continue
+    }
+    const list = /^(\d+[.)]|[-*])\s+(.+)$/.exec(trimmed)
+    if (list) {
+      flush()
+      rows += wrapLines(list[2] ?? '', Math.max(10, width - (list[1]?.length ?? 1) - 2)).length
+      continue
+    }
+    paragraph.push(trimmed)
+  }
+  flush()
+  return rows
+}
+
 /** Render a TodoWrite result (`- [status] content` lines) as a styled checklist. */
 function TodoView({ result }: { result: string }) {
   const items = result
@@ -1366,12 +1768,37 @@ function looksLikeToolDraft(text: string): boolean {
   return t.startsWith('{') || t.startsWith('[') || t.startsWith('<')
 }
 
-function spinnerLabel(live: Live): string {
+function phaseDot(active: boolean): string {
+  return active ? '●' : '·'
+}
+
+function graphProgressToJob(progress: GraphIndexProgress): LiveJob {
+  const pctByPhase: Record<GraphIndexProgress['phase'], number> = {
+    scan: 20,
+    repomap: 48,
+    write: 78,
+    done: 100,
+  }
+  return {
+    kind: 'index',
+    pct: pctByPhase[progress.phase],
+    label: progress.phase === 'done' ? 'GraphRAG indexed' : 'GraphRAG indexing',
+    message: progress.message,
+    stage: progress.phase,
+    phases: ['scan', 'repomap', 'write', 'done'],
+    current: progress.current,
+    total: progress.total,
+  }
+}
+
+function liveProgress(live: Live): { pct: number; label: string; stage: 'thinking' | 'drafting' | 'tools' | 'answering' } {
   const pending = live.tools.find(tool => tool.ok === undefined)
-  if (pending) return `running ${toolTitle(pending.name)}…`
-  if (live.think && !live.assistant) return 'thinking…'
-  if (looksLikeToolDraft(live.assistant)) return 'preparing action…'
-  return 'working…'
+  if (pending) return { pct: 70, label: `Running ${toolTitle(pending.name)}`, stage: 'tools' }
+  if (live.tools.length > 0 && live.assistant.trim() === '') return { pct: 82, label: 'Reading tool results', stage: 'tools' }
+  if (live.assistant.trim() !== '' && !looksLikeToolDraft(live.assistant)) return { pct: 92, label: 'Writing response', stage: 'answering' }
+  if (looksLikeToolDraft(live.assistant)) return { pct: 55, label: 'Preparing action', stage: 'drafting' }
+  if (live.think.trim() !== '') return { pct: 35, label: 'Thinking', stage: 'thinking' }
+  return { pct: 18, label: 'Starting turn', stage: 'thinking' }
 }
 
 function EditDiff({ raw }: { raw: unknown }) {
@@ -1384,22 +1811,6 @@ function EditDiff({ raw }: { raw: unknown }) {
     <Box flexDirection="column" marginLeft={2}>
       {oldStr !== undefined && <Text color={C.err}>{`- ${firstLines(oldStr, 6)}`}</Text>}
       {newStr !== undefined && <Text color={C.ok}>{`+ ${firstLines(newStr, 6)}`}</Text>}
-    </Box>
-  )
-}
-
-function ReasoningView({ text, live }: { text: string; live?: boolean }) {
-  return (
-    <Box marginTop={1} flexDirection="column">
-      <Text color={C.muted} dimColor>
-        {`${G.reasoning} ${live ? 'thinking' : 'thought'}  `}
-      </Text>
-      <Text color={C.muted} dimColor italic>
-        {firstLines(text.trim(), 10)
-          .split('\n')
-          .map(l => `   ${l}`)
-          .join('\n')}
-      </Text>
     </Box>
   )
 }
@@ -1443,7 +1854,8 @@ function StatusBar(props: {
       <Text color={C.muted}> · </Text>
       <Badge label={props.permMode} color={permColor} inverse />
       <Text color={C.muted}> · ctx </Text>
-      <Text color={C.accent}>{`${pct}%`}</Text>
+      <Text color={C.accent}>{meter(pct, 6)}</Text>
+      <Text color={C.muted}>{` ${pct}%`}</Text>
       <Text color={C.muted}>
         {` · ${props.tokPerSec} tok/s${props.loadMs ? ` · ${props.loadMs}ms` : ''}${props.active ? ` · +${formatTokens(props.tokensThisTurn)}` : ''}`}
       </Text>
@@ -1609,6 +2021,41 @@ export function QuestionPrompt({
   )
 }
 
+function ResumeSelector({
+  sessions,
+  selected,
+  width,
+}: {
+  sessions: SessionMetadata[]
+  selected: number
+  width: number
+}) {
+  const start = Math.max(0, Math.min(selected - 3, Math.max(0, sessions.length - 8)))
+  const visible = sessions.slice(start, start + 8)
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={C.accent} paddingX={1} width={width} marginTop={1}>
+      <Text color={C.accent} bold>Resume Session</Text>
+      <Text color={C.muted}>Select a saved conversation to restore into this workspace.</Text>
+      <Box flexDirection="column" marginTop={1}>
+        {visible.map((session, i) => {
+          const index = start + i
+          return (
+            <Text key={session.id} color={selected === index ? C.accentBright : C.muted} bold={selected === index}>
+              {selected === index ? '❯ ' : '  '}
+              <Text>{clip(session.title, 56)}</Text>
+              <Text color={C.muted}>{`  ${session.updatedAt}`}</Text>
+              <Text color={C.muted} dimColor>{`  ${session.id}`}</Text>
+            </Text>
+          )
+        })}
+      </Box>
+      <Text color={C.muted} dimColor>
+        {'  ↑/↓ select · ↵ resume · Esc cancel'}
+      </Text>
+    </Box>
+  )
+}
+
 function Option({ label, active }: { label: string; active: boolean }) {
   return (
     <Text color={active ? C.accentBright : C.muted} bold={active}>
@@ -1648,7 +2095,7 @@ function PlanView({ actions, width }: { actions: PlannedAction[]; width: number 
   )
 }
 
-const HELP = `Commands:  /help  /init  /plan  /context index|status  /effort low|medium|high|xhigh  /perm default|acceptEdits|plan|auto  /image <path>  /diff  /rewind  /sessions  /commit  /review  /clear  /exit
+const HELP = `Commands:  /help  /init  /plan  /context index|status  /effort low|medium|high|xhigh  /perm default|acceptEdits|plan|auto  /image <path>  /diff  /rewind  /resume  /commit  /review  /clear  /exit
 Modes:     /plan proposes changes without running them. default asks before edits, acceptEdits auto-applies file edits, auto runs unattended.
 Approvals:  [y] allow once  [a] always  [n] deny   ·   Keys: ^R thinking  ^O context  ↑/↓ history  ^C quit`
 

@@ -3,7 +3,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import { describe, expect, test } from 'bun:test'
 import type { ChatClient, ChatMessage, ChatOptions, ChatResult } from '@/provider/types.ts'
-import { initializeProject, renderProjectSnapshot } from './init.ts'
+import { initializeProject, limitVibeGuide, MAX_VIBE_GUIDE_CHARS, renderProjectSnapshot } from './init.ts'
 
 class CapturingClient implements ChatClient {
   messages: ChatMessage[] = []
@@ -19,6 +19,14 @@ class CapturingClient implements ChatClient {
 }
 
 describe('init project snapshot', () => {
+  test('caps an oversized generated guide at a section boundary', () => {
+    const guide = `# Overview\n${'a'.repeat(MAX_VIBE_GUIDE_CHARS)}\n## Architecture\n${'b'.repeat(500)}`
+    const limited = limitVibeGuide(guide)
+
+    expect(limited.length).toBeLessThan(MAX_VIBE_GUIDE_CHARS + 100)
+    expect(limited).toContain('Guide truncated by vibe init')
+  })
+
   test('includes static HTML evidence and does not invent package scripts', async () => {
     const ws = await mkdtemp(join(tmpdir(), 'vibe-init-static-'))
     await writeFile(join(ws, 'index.html'), '<!doctype html><title>Testing Grounds</title>', 'utf8')
@@ -35,8 +43,9 @@ describe('init project snapshot', () => {
     await mkdir(join(ws, 'assets'))
     await writeFile(join(ws, 'index.html'), '<h1>Static</h1>', 'utf8')
     const client = new CapturingClient()
+    const stages: string[] = []
 
-    await initializeProject(ws, client)
+    await initializeProject(ws, client, { onProgress: progress => stages.push(progress.stage) })
     const prompt = client.messages.map(message => message.content).join('\n')
     expect(prompt).toContain('index.html')
     expect(prompt).toContain('Detected project facts')
@@ -46,6 +55,9 @@ describe('init project snapshot', () => {
     expect(prompt).toContain('Do not mention frameworks, package managers')
     expect(prompt).toContain('Do not draw an ASCII tree')
     expect(await readFile(join(ws, 'VIBE.md'), 'utf8')).toContain('Static Page')
+    expect(stages).toContain('scan')
+    expect(stages).toContain('model')
+    expect(stages.at(-1)).toBe('done')
   })
 
   test('captures Rust/Cargo structure and source snippets for richer VIBE.md output', async () => {

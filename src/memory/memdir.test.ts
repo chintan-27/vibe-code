@@ -33,4 +33,13 @@ describe('memory directory', () => {
     expect(prompt).toContain('auth-flow')
     expect(renderMemoryPrompt([])).toContain('[none]')
   })
+
+  test('bounds oversized memory before adding it to a prompt', () => {
+    const prompt = renderMemoryPrompt([{
+      name: 'large', description: 'large memory', type: 'project', file: 'large.md', body: 'x'.repeat(20_000),
+    }])
+
+    expect(prompt.length).toBeLessThan(8_200)
+    expect(prompt).toContain('Memory truncated to preserve model context')
+  })
 })

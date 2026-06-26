@@ -15,6 +15,13 @@ describe('buildSystemPrompt', () => {
     expect(prompt).toContain('use TodoWrite')
     expect(prompt).toContain('Make generated apps actually runnable')
     expect(prompt).toContain('implement the real first-screen experience')
+    expect(prompt).toContain('Tools are optional')
+    expect(prompt).toContain('Do not call a tool merely because tools are available')
+    expect(prompt).toContain('Do not invent work')
+    expect(prompt).toContain('Do not falsely imply the capability does not exist')
+    expect(prompt).toContain('Match answer depth to the user')
+    expect(prompt).toContain('step-by-step method')
+    expect(prompt).toContain('include the equations, variables')
     expect(prompt).not.toContain('Plan mode:')
   })
 

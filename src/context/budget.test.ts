@@ -20,4 +20,14 @@ describe('dumpContext', () => {
     expect(result.approxTokens).toBeGreaterThan(0)
     expect(result.source).toBe('fallback')
   })
+
+  test('never exceeds a small context allocation', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'vibe-code-budget-'))
+    await mkdir(join(workspace, 'src'))
+    await writeFile(join(workspace, 'src', 'large.ts'), `export const value = '${'x'.repeat(20_000)}'\n`, 'utf8')
+
+    const result = await dumpContext(workspace, 'value', 100)
+
+    expect(result.approxTokens).toBeLessThanOrEqual(100)
+  })
 })

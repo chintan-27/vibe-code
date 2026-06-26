@@ -4,3 +4,6 @@ CLAUDE.md
 Plan.md
 node_modules
 VIBE.md
+.vibe
+.env
+.env.local

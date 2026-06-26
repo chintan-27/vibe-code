@@ -54,6 +54,13 @@ export async function runTwoPhaseStep(
   )
   const conclusion = stripThinkBlocks(reasoning) || reasoning.trim()
 
+  // If VibeThinker produced a substantive explanatory answer with no apparent tool need,
+  // emit it directly — qwen's JSON extraction step would only compress it.
+  if (conclusion.split(/\s+/).length > 200 && !likelyNeedsToolCall(conclusion)) {
+    opts.onToken?.(conclusion)
+    return conclusion
+  }
+
   // Phase 2 (high / xhigh) — overlookers critique the plan before acting.
   // xhigh always includes gemma; high includes it only if VIBE_REVIEW_GEMMA=1.
   const review =
@@ -61,11 +68,11 @@ export async function runTwoPhaseStep(
       ? await overlook(client, recent, conclusion, opts.effort === 'xhigh', opts.signal, opts.onThink)
       : ''
 
-  // Phase 3 — qwen extracts the structured action (streamed to the answer area).
+  // Phase 3 — qwen either extracts a required action or returns a direct response.
   const extractionMessages: ChatMessage[] = [
     {
       role: 'system',
-      content: `${systemPrompt}\n\n---\nYou are the extraction step. Convert the reasoning below into the next action using the tools and exact argument names defined above. Use the required JSON schema. Output no hidden reasoning.`,
+      content: `${systemPrompt}\n\n---\nYou are the extraction step. Return kind="tool" only when a tool is necessary for the user's explicit request. Otherwise return kind="final" with the best visible answer or one focused clarifying question. Preserve the useful detail from the reasoning and tool results; do not summarize a requested explanation, tutorial, math derivation, research answer, or architecture answer down to a short paragraph. Never invent a task, exploratory tool call, or next step merely because tools are available. Use the required JSON schema. Output no hidden reasoning.`,
     },
     {
       role: 'user',
@@ -114,7 +121,7 @@ async function constrainedExtract(
         {
           role: 'user',
           content:
-            'Return the next assistant output using the schema. Use kind="tool" with name and arguments for a tool call, or kind="final" with content when no tool is needed.',
+            'Return the next assistant output using the schema. Use kind="tool" with name and arguments for a tool call, or kind="final" with content when no tool is needed. For explanation, research, math, step-by-step, comparison, or architecture requests, final.content must be substantive and structured: include a scope/assumptions paragraph, numbered steps/stages, equations with variable definitions when math is requested, validation/caveats, and grounding from available context/tool results. If a web/search tool failed, explicitly state that failure instead of implying web research succeeded. Do not compress such answers into a brief summary.',
         },
       ],
       {
@@ -136,7 +143,7 @@ async function constrainedExtract(
           {
             role: 'user',
             content:
-              'Your previous constrained response was truncated. Return the complete action using the schema only.',
+              'Your previous constrained response was truncated. Return the complete action using the schema only. If kind="final", preserve the requested detail rather than shortening the answer.',
           },
         ],
         {
@@ -197,6 +204,11 @@ async function needsThinking(
 ): Promise<boolean> {
   const extractor = getModelProfile('extractor')
   const recent = renderRecent(messages.slice(1).slice(-RECENT_TAIL))
+  const latest = messages.filter(message => message.role === 'user').at(-1)?.content ?? ''
+  if (needsExplanatoryReasoning(latest)) {
+    onThink?.('[dynamic] reasoning needed for detailed explanation\n')
+    return true
+  }
   try {
     const res = await client.chat(
       extractor.model,
@@ -204,7 +216,7 @@ async function needsThinking(
         {
           role: 'system',
           content:
-            'Decide whether the latest coding request needs careful multi-step reasoning before acting (vs. a single obvious action). Reply with exactly YES or NO.',
+            'Reply YES only when the latest user request explicitly requires a multi-step tool-assisted action. Reply NO for statements, shared context, questions answerable from the conversation, or requests with no needed tool call. Reply with exactly YES or NO.',
         },
         { role: 'user', content: recent || (messages.at(-1)?.content ?? '') },
       ],
@@ -216,6 +228,14 @@ async function needsThinking(
   } catch {
     return true // when unsure, prefer reasoning
   }
+}
+
+function needsExplanatoryReasoning(input: string): boolean {
+  return /\b(in[- ]?depth|deep dive|step[- ]by[- ]step|stages?|math|equations?|derive|derivation|explain|how\b|research|gather information|architecture|compare|comparison)\b/i.test(input)
+}
+
+function likelyNeedsToolCall(text: string): boolean {
+  return /\{\s*"name"\s*:/i.test(text) || /\b(let me|I'll|I should|I need to)\s+(run|call|use|execute|search|read|write|edit|fetch|look up)\b/i.test(text)
 }
 
 /**

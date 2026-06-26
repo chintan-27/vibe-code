@@ -3,6 +3,8 @@ import { dirname, join, resolve } from 'path'
 
 const MAX_DEPTH = 32
 const INCLUDE_PATTERN = /^@(.+)$/gm
+/** Keep a single checked-in guide from crowding out the active task. */
+export const MAX_INSTRUCTION_CHARS = 16_000
 
 /** Project-instruction filenames, walked from cwd up to the filesystem root. */
 const INSTRUCTION_FILES = ['VIBE.md', 'AGENTS.md']
@@ -47,7 +49,48 @@ async function loadOne(
     await loadOne(resolved, entries, seen, depth + 1)
   }
 
-  entries.push({ path, content })
+  entries.push({ path, content: compactInstruction(content) })
+}
+
+/**
+ * Repository maps are retrieval's job. When a guide is too large, retain the
+ * actionable markdown sections instead of blindly keeping its opening tree.
+ */
+export function compactInstruction(content: string): string {
+  if (content.length <= MAX_INSTRUCTION_CHARS) return content
+  const sections = splitMarkdownSections(content)
+  if (sections.length === 0) return truncateInstruction(content)
+
+  const selected = sections
+    .sort((a, b) => sectionPriority(a.heading) - sectionPriority(b.heading))
+    .reduce<string[]>((kept, section) => {
+      const next = [...kept, section.content].join('\n\n')
+      return next.length <= MAX_INSTRUCTION_CHARS ? [...kept, section.content] : kept
+    }, [])
+  const result = selected.join('\n\n')
+  return result ? `${result}\n\n[Large instruction sections omitted to preserve model context.]` : truncateInstruction(content)
+}
+
+function splitMarkdownSections(content: string): Array<{ heading: string; content: string }> {
+  const matches = [...content.matchAll(/^#{1,3}\s+(.+)$/gm)]
+  if (matches.length === 0) return []
+  return matches.map((match, index) => {
+    const start = match.index ?? 0
+    const end = matches[index + 1]?.index ?? content.length
+    return { heading: match[1] ?? '', content: content.slice(start, end).trim() }
+  })
+}
+
+function sectionPriority(heading: string): number {
+  const normalized = heading.toLowerCase()
+  if (/(rules|instructions|must|workflow|command|convention|style|gotcha|development)/.test(normalized)) return 0
+  if (/(overview|architecture|build|run|test|configuration|memory)/.test(normalized)) return 1
+  if (/(repository structure|file tree|directory|tree|reference)/.test(normalized)) return 3
+  return 2
+}
+
+function truncateInstruction(content: string): string {
+  return `${content.slice(0, MAX_INSTRUCTION_CHARS)}\n\n[Instruction file truncated to preserve model context.]`
 }
 
 function ancestorDirs(start: string): string[] {

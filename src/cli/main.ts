@@ -4,6 +4,7 @@ import { dumpContext } from '@/context/budget.ts'
 import { initializeProject } from '@/cli/init.ts'
 import { runEvalSuite, summarizeEvalResults } from '@/eval/suite.ts'
 import { applyAmbientSettings, loadSettings } from '@/config/settings.ts'
+import { loadEnvFiles } from '@/config/env.ts'
 import { runAgentLoop } from '@/loop/agentLoop.ts'
 import type { EffortMode, PermissionMode } from '@/loop/types.ts'
 import { loadMcpTools } from '@/mcp/tools.ts'
@@ -19,6 +20,7 @@ import { stripThinkBlocks } from '@/toolcall/parse.ts'
 type Command = 'ping' | 'chat' | 'agent' | 'repl' | 'tui' | 'init' | 'dump-context' | 'eval' | 'help'
 
 const args = process.argv.slice(2)
+loadEnvFiles(process.cwd())
 // Bare `vibe` launches the TUI; `vibe <unknown>` still shows help.
 const command = args.length === 0 ? 'tui' : parseCommand(args[0])
 
@@ -96,6 +98,7 @@ async function runAgent(agentArgs: string[]): Promise<void> {
   }
 
   const root = parsed.workspace ?? process.cwd()
+  loadEnvFiles(root)
   const settings = await loadSettings(root)
   applyAmbientSettings(settings)
   const pluginMcpServers = await loadTrustedPluginMcpServers(root, settings)
@@ -123,6 +126,7 @@ async function runAgent(agentArgs: string[]): Promise<void> {
 async function runReplCommand(replArgs: string[]): Promise<void> {
   const parsed = parsePromptArgs(replArgs)
   const root = parsed.workspace ?? process.cwd()
+  loadEnvFiles(root)
   const settings = await loadSettings(root)
   applyAmbientSettings(settings)
   const pluginMcpServers = await loadTrustedPluginMcpServers(root, settings)
@@ -144,6 +148,7 @@ async function runReplCommand(replArgs: string[]): Promise<void> {
 async function runTuiCommand(tuiArgs: string[]): Promise<void> {
   const parsed = parsePromptArgs(tuiArgs)
   const root = parsed.workspace ?? process.cwd()
+  loadEnvFiles(root)
   const settings = await loadSettings(root)
   applyAmbientSettings(settings)
   const pluginMcpServers = await loadTrustedPluginMcpServers(root, settings)
@@ -167,11 +172,14 @@ async function runTuiCommand(tuiArgs: string[]): Promise<void> {
 async function runInitCommand(initArgs: string[]): Promise<void> {
   const parsed = parsePromptArgs(initArgs)
   const root = parsed.workspace ?? process.cwd()
+  loadEnvFiles(root)
   const client = new OllamaClient()
   const profile = getModelProfile('coder')
 
   console.log('Analyzing repository and writing VIBE.md…')
-  const result = await initializeProject(root, client)
+  const result = await initializeProject(root, client, {
+    onProgress: progress => console.error(`[init ${progress.pct}%] ${progress.label}: ${progress.message}`),
+  })
   console.log(`\n✓ Wrote ${result.path} and seeded a ${result.memoryName} memory.`)
 }
 
@@ -180,7 +188,9 @@ async function runDumpContext(contextArgs: string[]): Promise<void> {
   if (!parsed.prompt) {
     throw new Error('dump-context requires a query')
   }
-  const result = await dumpContext(parsed.workspace ?? process.cwd(), parsed.prompt)
+  const root = parsed.workspace ?? process.cwd()
+  loadEnvFiles(root)
+  const result = await dumpContext(root, parsed.prompt)
   console.log(result.content)
   console.error(`\napprox_tokens=${result.approxTokens}`)
 }

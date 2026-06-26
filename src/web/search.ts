@@ -1,6 +1,7 @@
 // Pluggable web-search backend. Pick a provider with VIBE_SEARCH_PROVIDER
 // (tavily | brave | searxng); default is Tavily because it returns clean,
 // LLM-ready snippets. Each provider needs its own credential/URL env var.
+import { envFilesChecked, envFilesLoaded } from '@/config/env.ts'
 
 export type SearchResult = { title: string; url: string; snippet: string }
 
@@ -30,7 +31,7 @@ export async function webSearch(query: string, maxResults = 5): Promise<SearchOu
 
 async function tavily(query: string, maxResults: number): Promise<SearchOutcome> {
   const key = process.env.TAVILY_API_KEY
-  if (!key) return { ok: false, error: 'TAVILY_API_KEY not set (get a free key at tavily.com, or set VIBE_SEARCH_PROVIDER=brave|searxng)' }
+  if (!key) return { ok: false, error: `TAVILY_API_KEY not set. ${envDiagnostics()}` }
   const res = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -43,6 +44,14 @@ async function tavily(query: string, maxResults: number): Promise<SearchOutcome>
     answer: json.answer,
     results: (json.results ?? []).map(r => ({ title: r.title ?? '', url: r.url ?? '', snippet: r.content ?? '' })),
   }
+}
+
+function envDiagnostics(): string {
+  const checked = envFilesChecked()
+  const loaded = envFilesLoaded()
+  const checkedText = checked.length ? checked.join(', ') : '[none recorded; restart vibe from the CLI]'
+  const loadedText = loaded.length ? loaded.join(', ') : '[none]'
+  return `Checked env files: ${checkedText}. Loaded env files: ${loadedText}. Put shared search credentials in ~/.config/vibe/.env or set VIBE_SEARCH_PROVIDER=brave|searxng.`
 }
 
 async function brave(query: string, maxResults: number): Promise<SearchOutcome> {

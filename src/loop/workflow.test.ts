@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { describe, expect, test } from 'bun:test'
-import { createToolCheckpoint, listCheckpoints, listSessionMetadata, restoreCheckpoint, writeSessionMetadata } from './workflow.ts'
+import { createToolCheckpoint, listCheckpoints, listSessionMetadata, readSessionState, restoreCheckpoint, writeSessionMetadata, writeSessionState } from './workflow.ts'
 
 describe('workflow persistence', () => {
   test('mutating tools create checkpoints before edits', async () => {
@@ -44,5 +44,28 @@ describe('workflow persistence', () => {
 
     const sessions = await listSessionMetadata(ws)
     expect(sessions.map(s => s.id)).toEqual(['new', 'old'])
+  })
+
+  test('session state persists messages and stays out of metadata listing', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-session-state-'))
+    await writeSessionState(ws, {
+      metadata: {
+        id: 'stateful',
+        title: 'Stateful',
+        cwd: ws,
+        startedAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-01T00:00:00.000Z',
+        lastUserPrompt: 'hello',
+        compactSummary: 'done',
+      },
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi' },
+      ],
+    })
+
+    const state = await readSessionState(ws, 'stateful')
+    expect(state.messages.map(message => message.content)).toEqual(['hello', 'hi'])
+    expect((await listSessionMetadata(ws)).map(session => session.id)).toEqual(['stateful'])
   })
 })

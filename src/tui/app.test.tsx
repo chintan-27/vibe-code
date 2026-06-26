@@ -1,4 +1,4 @@
-import { mkdtemp } from 'fs/promises'
+import { mkdir, mkdtemp, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
@@ -108,7 +108,10 @@ describe('TUI App', () => {
     await delay(80) // simulate a human pause before Enter (paste newlines arrive far faster)
     stdin.write('\r')
     await delay(50)
-    expect(lastFrame() ?? '').toContain('Commands:')
+    const frame = lastFrame() ?? ''
+    expect(frame).toContain('Commands:')
+    expect(frame).toContain('/resume')
+    expect(frame).not.toContain('/sessions')
     unmount()
   })
 
@@ -121,6 +124,64 @@ describe('TUI App', () => {
     expect(frame).toContain('Commands')
     expect(frame).toContain('/help')
     expect(frame).toContain('/init')
+    expect(frame).not.toContain('/sessions')
+    unmount()
+  })
+
+  test('/resume opens a selector and Enter restores a saved session', async () => {
+    const ws = await mkdtemp(join(tmpdir(), 'vibe-resume-'))
+    await mkdir(join(ws, '.vibe', 'sessions'), { recursive: true })
+    await writeFile(
+      join(ws, '.vibe', 'sessions', 'session-a.json'),
+      JSON.stringify({
+        id: 'session-a',
+        title: 'Fix search config',
+        cwd: ws,
+        startedAt: '2026-06-26T10:00:00.000Z',
+        updatedAt: '2026-06-26T10:01:00.000Z',
+        lastUserPrompt: 'fix it',
+        compactSummary: '',
+      }),
+    )
+    await writeFile(
+      join(ws, '.vibe', 'sessions', 'session-a.state.json'),
+      JSON.stringify({
+        metadata: {
+          id: 'session-a',
+          title: 'Fix search config',
+          cwd: ws,
+          startedAt: '2026-06-26T10:00:00.000Z',
+          updatedAt: '2026-06-26T10:01:00.000Z',
+          lastUserPrompt: 'fix it',
+          compactSummary: 'done',
+        },
+        messages: [
+          { role: 'user', content: 'fix it' },
+          { role: 'assistant', content: '{"name":"WebSearch","arguments":{"query":"x"}}' },
+          { role: 'tool', toolName: 'WebSearch', content: 'ok\n1. Search result' },
+          { role: 'assistant', content: '## Result\n1. **Done** with `WebSearch`.' },
+        ],
+      }),
+    )
+    const { lastFrame, stdin, unmount } = render(<App options={{ workspaceRoot: ws, effort: 'medium', permissionMode: 'auto' }} />)
+    await delay(50)
+    stdin.write('/resume   ')
+    await delay(80)
+    stdin.write('\r')
+    await delay(80)
+    expect(lastFrame() ?? '').toContain('Resume Session')
+    expect(lastFrame() ?? '').toContain('Fix search config')
+    stdin.write('\r')
+    await delay(80)
+    const frame = lastFrame() ?? ''
+    expect(frame).toContain('› fix it')
+    expect(frame).toContain('WebSearch')
+    expect(frame).toContain('Result')
+    expect(frame).toContain('Done')
+    expect(frame).not.toContain('## Result')
+    expect(frame).not.toContain('**Done**')
+    expect(frame).not.toContain('Resumed session-a')
+    expect(frame).not.toContain('usage: /resume')
     unmount()
   })
 

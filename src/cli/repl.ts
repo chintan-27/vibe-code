@@ -5,7 +5,7 @@ import type { HooksConfig } from '@/hooks/hooks.ts'
 import { AgentSession } from '@/loop/session.ts'
 import type { EffortMode, SessionEvents } from '@/loop/types.ts'
 import { loadMemories } from '@/memory/memdir.ts'
-import { listCheckpoints, listSessionMetadata, restoreCheckpoint } from '@/loop/workflow.ts'
+import { listCheckpoints, listSessionMetadata, readSessionState, restoreCheckpoint } from '@/loop/workflow.ts'
 import type { PluginSettings } from '@/plugins/manager.ts'
 import { extensionInfo, extensionSummary, installExtension, removeExtension, setExtensionEnabled, trustExtension } from '@/plugins/manager.ts'
 import { OllamaClient } from '@/provider/ollama.ts'
@@ -129,7 +129,9 @@ export async function runRepl(options: ReplOptions): Promise<void> {
       } else if (command === 'init') {
         console.log('Analyzing repository and writing VIBE.md…')
         try {
-          const result = await initializeProject(options.workspaceRoot, client)
+          const result = await initializeProject(options.workspaceRoot, client, {
+            onProgress: progress => console.error(`[init ${progress.pct}%] ${progress.label}: ${progress.message}`),
+          })
           console.log(`Wrote ${result.path} and seeded a ${result.memoryName} memory.`)
         } catch (error) {
           console.log(`init failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -157,15 +159,23 @@ export async function runRepl(options: ReplOptions): Promise<void> {
           )
           console.log('Restore with /rewind restore <sessionId> <turn> --confirm')
         }
-      } else if (command === 'sessions') {
-        const sessions = await listSessionMetadata(options.workspaceRoot)
-        console.log(
-          sessions.length === 0
-            ? 'No saved sessions yet.'
-            : sessions.map(s => `${s.id}  ${s.updatedAt}  ${s.title}`).join('\n'),
-        )
       } else if (command === 'resume') {
-        console.log(arg ? `Resume ${arg} is planned, but full resume is not available yet.` : 'usage: /resume <session-id>')
+        if (arg) {
+          try {
+            const state = await readSessionState(options.workspaceRoot, arg)
+            session.restore(state)
+            console.log(`Resumed ${state.metadata.id} · ${state.metadata.title}`)
+          } catch (error) {
+            console.log(`resume failed: ${error instanceof Error ? error.message : String(error)}`)
+          }
+        } else {
+          const sessions = await listSessionMetadata(options.workspaceRoot)
+          console.log(
+            sessions.length === 0
+              ? 'No saved sessions yet.'
+              : sessions.map(s => `${s.id}  ${s.updatedAt}  ${s.title}`).join('\n'),
+          )
+        }
       } else if (command === 'plugins') {
         console.log(await runPluginCommand(options.workspaceRoot, arg, options.extensionSettings))
       } else {
@@ -206,8 +216,7 @@ function printHelp(): void {
   /init              Generate VIBE.md and seed project memory
   /diff              Show working-tree summary
   /rewind            List recent checkpoints
-  /sessions          List saved session metadata
-  /resume <id>       Planned resume interface
+  /resume [id]       List saved sessions, or restore one by id
   /plugins <cmd>     Manage skills/plugins: list, add, info, enable, disable, trust, remove
   /effort <m>        Switch effort: low | medium | high | xhigh (resets conversation)
   /commit            Stage and commit current changes
